@@ -53,6 +53,7 @@ import type {
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 type CompactCapableApi = "openai-responses" | "openai-codex-responses";
 type CompactCapableModel = Model<CompactCapableApi>;
+const CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
 
 interface StoredOpenAICompactWindow {
 	type: "openai-compact-window";
@@ -86,10 +87,13 @@ function isStoredOpenAICompactWindow(details: unknown): details is StoredOpenAIC
 	);
 }
 
-function resolveCompactUrl(rawValue: string | undefined, fallbackBaseUrl: string): string {
+function resolveCompactUrl(rawValue: string | undefined, model: CompactCapableModel): string {
+	const fallbackBaseUrl = model.baseUrl;
 	const value = rawValue?.trim() || fallbackBaseUrl.trim();
 	if (!value) {
-		return "https://api.openai.com/v1/responses/compact";
+		return model.api === "openai-codex-responses"
+			? "https://chatgpt.com/backend-api/codex/responses/compact"
+			: "https://api.openai.com/v1/responses/compact";
 	}
 	if (value.endsWith("/responses/compact")) {
 		return value;
@@ -97,6 +101,21 @@ function resolveCompactUrl(rawValue: string | undefined, fallbackBaseUrl: string
 
 	const url = new URL(value);
 	const pathname = url.pathname.replace(/\/+$/, "");
+
+	if (model.api === "openai-codex-responses" && !rawValue) {
+		if (pathname.endsWith("/codex/responses")) {
+			url.pathname = `${pathname}/compact`;
+			return url.toString();
+		}
+		if (pathname.endsWith("/codex")) {
+			url.pathname = `${pathname}/responses/compact`;
+			return url.toString();
+		}
+		if (pathname.endsWith("/backend-api")) {
+			url.pathname = `${pathname}/codex/responses/compact`;
+			return url.toString();
+		}
+	}
 
 	if (pathname === "") {
 		url.pathname = "/v1/responses/compact";
@@ -110,6 +129,26 @@ function resolveCompactUrl(rawValue: string | undefined, fallbackBaseUrl: string
 
 	url.pathname = `${pathname}/responses/compact`;
 	return url.toString();
+}
+
+function extractCodexAccountId(token: string): string | undefined {
+	try {
+		const parts = token.split(".");
+		if (parts.length !== 3) return undefined;
+		const payload = JSON.parse(Buffer.from(parts[1] || "", "base64url").toString("utf8")) as {
+			[CODEX_JWT_CLAIM_PATH]?: { chatgpt_account_id?: string };
+		};
+		return payload?.[CODEX_JWT_CLAIM_PATH]?.chatgpt_account_id;
+	} catch {
+		return undefined;
+	}
+}
+
+function createRequestId(): string {
+	if (typeof globalThis.crypto?.randomUUID === "function") {
+		return globalThis.crypto.randomUUID();
+	}
+	return `compact_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function parseTextSignature(
@@ -475,6 +514,7 @@ function buildDisplaySummary(response: CompactedResponse, endpoint: string, mode
 
 async function callCompactEndpoint(
 	endpoint: string,
+	model: CompactCapableModel,
 	apiKey: string | undefined,
 	body: ResponseCompactParams,
 	signal: AbortSignal,
@@ -482,6 +522,24 @@ async function callCompactEndpoint(
 	const headers = new Headers({ "Content-Type": "application/json" });
 	if (apiKey) {
 		headers.set("Authorization", `Bearer ${apiKey}`);
+	}
+	for (const [key, value] of Object.entries(model.headers || {})) {
+		headers.set(key, value);
+	}
+	if (model.api === "openai-codex-responses" && apiKey) {
+		const accountId = extractCodexAccountId(apiKey);
+		headers.set("Accept", "application/json");
+		headers.set("Connection", "Keep-Alive");
+		headers.set("Session_id", createRequestId());
+		if (accountId) {
+			headers.set("chatgpt-account-id", accountId);
+		}
+		if (!headers.has("originator")) {
+			headers.set("originator", "codex_cli_rs");
+		}
+		if (!headers.has("User-Agent")) {
+			headers.set("User-Agent", "Codex/1.0.0 pi-openai-compact-extension");
+		}
 	}
 
 	const response = await fetch(endpoint, {
@@ -523,7 +581,7 @@ export default function openAICompactExtension(pi: ExtensionAPI) {
 		}
 
 		const model = ctx.model as CompactCapableModel;
-		const endpoint = resolveCompactUrl(process.env.PI_OPENAI_COMPACT_URL, model.baseUrl);
+		const endpoint = resolveCompactUrl(process.env.PI_OPENAI_COMPACT_URL, model);
 		const configuredApiKey = process.env.PI_OPENAI_COMPACT_API_KEY;
 		const apiKey = configuredApiKey || (await ctx.modelRegistry.getApiKey(model));
 		const input = buildCurrentCompactionInput(event.branchEntries, model);
@@ -538,11 +596,11 @@ export default function openAICompactExtension(pi: ExtensionAPI) {
 			const compactBody: ResponseCompactParams = {
 				model: model.id,
 				input,
-				instructions: ctx.getSystemPrompt() || undefined,
+				instructions: ctx.getSystemPrompt(),
 				prompt_cache_key: ctx.sessionManager.getSessionId(),
 			};
 
-			const response = await callCompactEndpoint(endpoint, apiKey, compactBody, event.signal);
+			const response = await callCompactEndpoint(endpoint, model, apiKey, compactBody, event.signal);
 			const details: StoredOpenAICompactWindow = {
 				type: "openai-compact-window",
 				version: 1,

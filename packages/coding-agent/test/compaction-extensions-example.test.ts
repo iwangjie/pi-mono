@@ -76,15 +76,41 @@ describe("Documentation example", () => {
 	});
 
 	it("openai compact example should resolve proxy and OpenAI URLs", () => {
-		expect(resolveCompactUrl("http://127.0.0.1:8317/", "https://api.openai.com/v1")).toBe(
+		const openAIModel: Model<"openai-responses"> = {
+			id: "gpt-5.4",
+			name: "GPT-5.4",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const codexModel: Model<"openai-codex-responses"> = {
+			id: "gpt-5.4",
+			name: "GPT-5.4",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+
+		expect(resolveCompactUrl("http://127.0.0.1:8317/", openAIModel)).toBe(
 			"http://127.0.0.1:8317/v1/responses/compact",
 		);
-		expect(resolveCompactUrl("https://api.openai.com/v1", "https://api.openai.com/v1")).toBe(
+		expect(resolveCompactUrl("https://api.openai.com/v1", openAIModel)).toBe(
 			"https://api.openai.com/v1/responses/compact",
 		);
-		expect(resolveCompactUrl("https://proxy.example.com/v1/responses/compact", "https://api.openai.com/v1")).toBe(
+		expect(resolveCompactUrl("https://proxy.example.com/v1/responses/compact", openAIModel)).toBe(
 			"https://proxy.example.com/v1/responses/compact",
 		);
+		expect(resolveCompactUrl(undefined, codexModel)).toBe("https://chatgpt.com/backend-api/codex/responses/compact");
 	});
 
 	it("openai compact example should replace fallback compaction prefix with stored window", () => {
