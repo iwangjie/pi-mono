@@ -95,6 +95,26 @@ pi --model claude-opus-4-5
 pi --help
 ```
 
+### 复用宿主机历史会话（重要）
+
+`pi` 的会话目录按 `cwd` 编码分组存储在 `~/.pi/agent/sessions/`。
+
+如果容器里把项目挂载到 `/workspace`，那么 `cwd` 从宿主机的 `/Users/...` 变成 `/workspace`，看起来就像“没读到以前的 session”。
+
+更稳的做法是让容器内的工作目录路径和宿主机一致：
+
+```bash
+docker run --rm -it --init --name pi-elegant \
+  -w "$PWD" \
+  -v "$PWD:$PWD" \
+  -v "$HOME/.pi:/root/.pi" \
+  -v "$HOME/.npm:/root/.npm" \
+  -e TZ=Asia/Shanghai \
+  -e PI_CODING_AGENT_DIR=/root/.pi/agent \
+  pi-elegant-base \
+  npx -y @mariozechner/pi-coding-agent@latest
+```
+
 ### 当容器内二次沙箱有权限问题时
 
 如果遇到 `bwrap` 权限相关问题，可临时关闭 `coding-agent` 扩展沙箱，仅保留 Docker 隔离层：
@@ -129,3 +149,8 @@ pi --no-sandbox
 处理：
 - 先执行构建命令，确认 `docker image ls pi-elegant-base` 可见后再运行
 
+### 4. “映射了 `~/.pi` 但 pi 没读到”
+
+关键点：
+- `coding-agent` 的全局目录默认是 `~/.pi/agent`，不是 `~/.pi` 根目录
+- 如有疑义，直接在容器里固定：`-e PI_CODING_AGENT_DIR=/root/.pi/agent`
