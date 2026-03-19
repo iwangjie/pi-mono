@@ -665,17 +665,26 @@ async function generateModels() {
 		if (candidate.provider === "amazon-bedrock" && candidate.id.includes("anthropic.claude-opus-4-6-v1")) {
 			candidate.cost.cacheRead = 0.5;
 			candidate.cost.cacheWrite = 6.25;
-			candidate.contextWindow = 1000000;
-		}
-		if (candidate.provider === "amazon-bedrock" && candidate.id.includes("anthropic.claude-sonnet-4-6")) {
-			candidate.contextWindow = 1000000;
 		}
 		if (
-			(candidate.provider === "anthropic" || candidate.provider === "opencode" || candidate.provider === "opencode-go") &&
-			(candidate.id === "claude-opus-4-6" || candidate.id === "claude-sonnet-4-6")
+			(candidate.provider === "anthropic" ||
+				candidate.provider === "opencode" ||
+				candidate.provider === "opencode-go" ||
+				candidate.provider === "github-copilot") &&
+			(candidate.id === "claude-opus-4-6" ||
+				candidate.id === "claude-sonnet-4-6" ||
+				candidate.id === "claude-opus-4.6" ||
+				candidate.id === "claude-sonnet-4.6")
 		) {
 			candidate.contextWindow = 1000000;
 		}
+		if (
+			candidate.provider === "google-antigravity" &&
+			(candidate.id === "claude-opus-4-6-thinking" || candidate.id === "claude-sonnet-4-6")
+		) {
+			candidate.contextWindow = 1000000;
+		}
+
 		// OpenCode variants list Claude Sonnet 4/4.5 with 1M context, actual limit is 200K
 		if (
 			(candidate.provider === "opencode" || candidate.provider === "opencode-go") &&
@@ -722,7 +731,7 @@ async function generateModels() {
 				cacheRead: 0.5,
 				cacheWrite: 6.25,
 			},
-			contextWindow: 1000000,
+			contextWindow: 200000,
 			maxTokens: 128000,
 		});
 	}
@@ -993,6 +1002,18 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-5.4-mini",
+			name: "GPT-5.4 Mini",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
