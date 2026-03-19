@@ -30,7 +30,7 @@ type CoreMethodCandidate = ProbeSearchPayload["candidates"][number] & {
 
 const ProbeCoreMethodParams = Type.Object({
 	query: Type.String({
-		description: "Business concept or task, for example `自由职业者签约核心方法`.",
+		description: "Business concept or task, for example `支付回调核心方法` or `订单路由入口`.",
 	}),
 	path: Type.Optional(
 		Type.String({ description: "Directory or file path to search. Defaults to the current project." }),
@@ -81,24 +81,36 @@ function buildCoreMethodQueryVariants(query: string): Array<{ stage: string; que
 	const chainTerms: string[] = [];
 
 	const lowerQuery = query.toLowerCase();
-	if (query.includes("自由职业者") || query.includes("灵工") || lowerQuery.includes("soho")) {
-		semanticTerms.push("自由职业者", "soho");
-		chainTerms.push("Soho", "SohoSign", "SignReq");
-	}
-	if (query.includes("服务商") || lowerQuery.includes("merchant") || lowerQuery.includes("levy")) {
-		semanticTerms.push("服务商", "merchant", "levy");
+	if (
+		query.includes("核心方法") ||
+		query.includes("调用") ||
+		query.includes("入口") ||
+		query.includes("路由") ||
+		query.includes("处理") ||
+		lowerQuery.includes("route") ||
+		lowerQuery.includes("dispatch") ||
+		lowerQuery.includes("handler")
+	) {
+		chainTerms.push("funCode", "dispatch", "route", "controller", "handler", "RequestMapping");
 	}
 	if (
-		query.includes("签约") ||
-		query.includes("签署") ||
-		lowerQuery.includes("sign") ||
-		lowerQuery.includes("contract")
+		query.includes("服务") ||
+		query.includes("执行") ||
+		query.includes("实现") ||
+		lowerQuery.includes("service") ||
+		lowerQuery.includes("execute") ||
+		lowerQuery.includes("process")
 	) {
-		semanticTerms.push("签约", "sign", "contract");
-		chainTerms.push("doBusiness", "execute", "process");
+		chainTerms.push("service", "ServiceImpl", "doBusiness", "executeBusiness", "execute", "process");
 	}
-	if (query.includes("核心方法") || query.includes("调用") || query.includes("入口")) {
-		chainTerms.push("funCode", "dispatch", "route", "controller", "service");
+	if (
+		query.includes("请求") ||
+		query.includes("参数") ||
+		lowerQuery.includes("request") ||
+		lowerQuery.includes("req") ||
+		lowerQuery.includes("dto")
+	) {
+		chainTerms.push("Request", "Req", "DTO");
 	}
 
 	const focusedQuery = uniqueStrings([...focusedTerms, ...semanticTerms])
@@ -111,6 +123,7 @@ function buildCoreMethodQueryVariants(query: string): Array<{ stage: string; que
 		"dispatch",
 		"route",
 		"controller",
+		"RequestMapping",
 	])
 		.slice(0, 7)
 		.join(" ");
@@ -119,6 +132,7 @@ function buildCoreMethodQueryVariants(query: string): Array<{ stage: string; que
 		...semanticTerms.slice(0, 3),
 		...chainTerms,
 		"doBusiness",
+		"executeBusiness",
 		"service",
 	])
 		.slice(0, 7)
@@ -225,13 +239,13 @@ async function runCoreMethodRgFallback(
 		...focusedTerms,
 		"funCode",
 		"doBusiness",
+		"executeBusiness",
 		"execute",
 		"dispatch",
 		"process",
 		"handle",
-		"SignReq",
-		"Soho",
-		"SohoSign",
+		"ServiceImpl",
+		"RequestMapping",
 	]).map(escapeRegExp);
 
 	if (regexTerms.length === 0) {
@@ -301,7 +315,7 @@ async function runCoreMethodRgFallback(
 			score += 12;
 			explain.push("core-method naming hint");
 		}
-		if (/funCode|SignReq|Soho/i.test(preview)) {
+		if (/funCode|Request|Req|DTO/i.test(preview)) {
 			score += 10;
 			explain.push("dispatch/request marker");
 		}
@@ -379,6 +393,7 @@ function buildRecommendedNextActions(candidate: CoreMethodCandidate | undefined,
 	return [
 		`Next best action: probe_extract ${candidate.extract_target}`,
 		...(bestNextChange ? [`Best next change if this still looks wrong: ${bestNextChange}`] : []),
+		"Keep the query short and mix business words with Java identifiers such as funCode, request types, class names, or method names.",
 		(candidate.upstream_routes?.length ?? 0) > 0
 			? "If you need entrypoint proof, extract the route, funCode carrier, or enum referenced by the candidate."
 			: "If you need entrypoint proof, extract the nearest controller or dispatch carrier next.",
@@ -407,18 +422,18 @@ export function registerProbeCoreMethod(pi: ExtensionAPI) {
 		name: "probe_core_method",
 		label: "Probe Core Method",
 		description:
-			"Find the most likely core execution method for a business concept. This is an opinionated multi-stage workflow for route/controller/dispatch/service chains, with lighter defaults and stronger guidance than raw probe_search.",
+			"Find the most likely core execution method for a business concept. This is an opinionated multi-stage workflow tuned for Java, Maven, JSP, and Spring-style route/controller/dispatch/service chains, with lighter defaults and stronger guidance than raw probe_search.",
 		promptSnippet:
-			"Default high-level workflow for finding the core execution path. Use this instead of manually tuning probe_search when the task is to identify the main method, handler, or dispatch chain.",
+			"Default high-level workflow for finding the core execution path in Java/Spring projects. Use this instead of manually tuning probe_search when the task is to identify the main method, handler, or dispatch chain.",
 		promptGuidelines: [
 			"Use this first when the user asks which method, handler, service, or route is the core execution path.",
-			"If the module boundary is known, pass module_hint. The tool will keep the workflow simple and only tighten scope when that helps.",
+			"If the module boundary is known, pass module_hint. The tool starts from prefer-style narrowing and only tightens further when that helps.",
 		],
 		parameters: ProbeCoreMethodParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const searchPath = normalizeOptionalString(params.path) ?? ctx.cwd;
 			const moduleHint = params.module_hint ?? [];
-			const moduleScope = params.module_scope ?? (moduleHint.length > 0 ? "strict" : "prefer");
+			const moduleScope = params.module_scope ?? "prefer";
 			const queryVariants = buildCoreMethodQueryVariants(params.query);
 			const workflow: CoreMethodWorkflowStep[] = [];
 			const mergedCandidates = new Map<string, CoreMethodCandidate>();
@@ -426,7 +441,10 @@ export function registerProbeCoreMethod(pi: ExtensionAPI) {
 			let bestNextChange: string | undefined;
 
 			for (const [index, variant] of queryVariants.entries()) {
-				const stageModuleScope = moduleHint.length > 0 && index < 2 ? moduleScope : "prefer";
+				const stageModuleScope =
+					moduleScope === "strict" && moduleHint.length > 0 && index === queryVariants.length - 1
+						? "strict"
+						: "prefer";
 				const searchResult = await executeProbeSearch(
 					pi,
 					{

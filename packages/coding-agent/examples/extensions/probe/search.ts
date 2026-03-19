@@ -148,7 +148,7 @@ export const ProbeSearchParams = Type.Object({
 	),
 	module_hint: Type.Optional(
 		Type.Array(Type.String(), {
-			description: 'Optional module or path hints to boost, for example ["trans-business", "merchant/service"].',
+			description: 'Optional module or path hints to boost, for example ["order-service", "payment/core"].',
 		}),
 	),
 	module_scope: Type.Optional(ProbeModuleScope),
@@ -156,7 +156,7 @@ export const ProbeSearchParams = Type.Object({
 	synonym_expansion: Type.Optional(
 		Type.Boolean({
 			description:
-				"Default false. Expand a small built-in business synonym set for ranking and query rewriting, for example 自由职业者 -> soho.",
+				"Default false. Expand a small built-in Java/Spring synonym set plus any project-level synonyms from config files.",
 		}),
 	),
 	include_globs: Type.Optional(
@@ -244,15 +244,24 @@ export interface ProbeSearchExecuteOptions {
 }
 
 const BUILTIN_QUERY_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
-	自由职业者: ["soho", "灵工"],
-	soho: ["自由职业者", "灵工"],
-	灵工: ["自由职业者", "soho"],
-	签约: ["签署", "sign", "contract", "signreq", "dobusiness"],
-	签署: ["签约", "sign", "contract"],
-	服务商: ["merchant", "provider"],
-	levy: ["merchant", "服务商"],
-	merchant: ["服务商", "levy"],
-	平台: ["platform"],
+	controller: ["handler", "router", "route"],
+	handler: ["controller", "router", "dispatch"],
+	router: ["controller", "route", "dispatch"],
+	route: ["router", "controller", "dispatch"],
+	service: ["serviceimpl", "manager", "processor", "executor"],
+	serviceimpl: ["service", "manager", "processor", "executor"],
+	request: ["req", "dto", "command"],
+	req: ["request", "dto", "command"],
+	response: ["resp", "result"],
+	resp: ["response", "result"],
+	dispatch: ["route", "router", "handler"],
+	execute: ["process", "handle", "dobusiness", "executebusiness"],
+	process: ["execute", "handle", "dobusiness"],
+	handle: ["execute", "process", "dispatch"],
+	dobusiness: ["execute", "process", "executebusiness"],
+	executebusiness: ["execute", "process", "dobusiness"],
+	funcode: ["enum", "constant", "constants"],
+	enum: ["funcode", "constant", "constants"],
 };
 
 function splitQueryTerms(query: string): string[] {
@@ -313,6 +322,29 @@ function getMatchedTerms(text: string, terms: string[]): string[] {
 
 function isCodeFile(path: string): boolean {
 	return /\.(java|kt|scala|groovy|go|rs|py|ts|tsx|js|jsx|c|cc|cpp|cs)$/i.test(path);
+}
+
+function looksLikeIdentifier(term: string): boolean {
+	return (
+		/[A-Z_]/.test(term) ||
+		/[a-z][A-Z]/.test(term) ||
+		/\d/.test(term) ||
+		term.includes("_") ||
+		term.toLowerCase().includes("req") ||
+		term.toLowerCase().includes("service") ||
+		term.toLowerCase().includes("controller") ||
+		term.toLowerCase().includes("funcode")
+	);
+}
+
+function queryNeedsCodeLanguageBridge(query: string): boolean {
+	const terms = splitQueryTerms(query);
+	if (terms.length === 0) {
+		return false;
+	}
+	const hasIdentifier = terms.some(looksLikeIdentifier);
+	const hasChineseBusinessTerm = terms.some((term) => /[\u4e00-\u9fff]/.test(term));
+	return hasChineseBusinessTerm && !hasIdentifier;
 }
 
 function pathHasAnyHint(path: string, hints: string[]): boolean {
@@ -494,6 +526,30 @@ function rankProbeSearchHit(
 		score += 4;
 		explain.push("code file");
 	}
+	if (/(^|\/)src\/main\/java\//.test(fileLower)) {
+		score += 8;
+		explain.push("java source root");
+	}
+	if (/(^|\/)src\/main\/webapp\//.test(fileLower)) {
+		score -= 3;
+		explain.push("webapp view penalty");
+	}
+	if (/serviceimpl\.java$/.test(fileLower)) {
+		score += 10;
+		explain.push("java service implementation");
+	}
+	if (/(controller|handler|router)\.java$/.test(fileLower)) {
+		score += 9;
+		explain.push("java entrypoint class");
+	}
+	if (/(enum|constant|constants)\.java$/.test(fileLower)) {
+		score += 4;
+		explain.push("java routing constant or enum");
+	}
+	if (/test\/|src\/test\//.test(fileLower)) {
+		score -= 6;
+		explain.push("test path penalty");
+	}
 	if (/\.(properties|yaml|yml|toml|ini|conf|cfg)$/.test(fileLower)) {
 		score -= 8;
 		explain.push("config file penalty");
@@ -527,7 +583,17 @@ function rankProbeSearchHit(
 			explain.push("spring route annotation");
 		}
 		if (
+			snippetLower.includes("@service") ||
+			snippetLower.includes("@component") ||
+			snippetLower.includes("@transactional") ||
+			snippetLower.includes("@autowired")
+		) {
+			score += 8;
+			explain.push("spring service wiring hint");
+		}
+		if (
 			snippetLower.includes("dobusiness(") ||
+			snippetLower.includes("executebusiness(") ||
 			snippetLower.includes("process(") ||
 			snippetLower.includes("handle(") ||
 			snippetLower.includes("execute(") ||
@@ -554,6 +620,7 @@ function rankProbeSearchHit(
 			snippetLower.includes("funcode") ||
 			snippetLower.includes("dispatch(") ||
 			snippetLower.includes("execute(") ||
+			snippetLower.includes("executebusiness(") ||
 			snippetLower.includes("dobusiness(")
 		) {
 			score += 16;
@@ -614,6 +681,9 @@ function deriveCallChainHint(file: string, snippet: string): string | undefined 
 	}
 	if (snippetLower.includes("funcode") || snippetLower.includes("enum")) {
 		return "Controller/Route -> Enum/Dispatch -> Handler/Service";
+	}
+	if (snippetLower.includes("executebusiness(")) {
+		return "Dispatch/Service -> executeBusiness -> downstream processor/gateway/DAO";
 	}
 	if (/(service|serviceimpl|manager|processor|executor|biz)/.test(fileLower)) {
 		return "Service -> downstream processor/gateway/DAO";
@@ -679,6 +749,9 @@ function deriveWhyThisIsCore(hit: RankedProbeSearchHit): string[] {
 	if (snippetLower.includes("funcode")) {
 		reasons.push("funCode-style dispatch present");
 	}
+	if (snippetLower.includes("executebusiness(")) {
+		reasons.push("executeBusiness-style orchestration present");
+	}
 	if (snippetLower.includes("signreq") || snippetLower.includes("sign")) {
 		reasons.push("signing request vocabulary present");
 	}
@@ -703,6 +776,14 @@ function deriveSearchGuidance(
 	const queryTermCount = splitQueryTerms(query).length;
 
 	if (candidates.length === 0) {
+		if (queryNeedsCodeLanguageBridge(query)) {
+			return {
+				primaryFailureReason:
+					"The query is mostly business wording, but the code likely uses Java identifiers, enum names, request types, or funCode constants instead.",
+				bestNextChange:
+					"Retry with 2-6 terms that mix business words with code identifiers, for example class names, funCode, request types, or method names.",
+			};
+		}
 		if (options.moduleScope === "strict" && options.moduleHint.length > 0) {
 			return {
 				primaryFailureReason: `No candidates survived strict module filtering for ${options.moduleHint.join(", ")}.`,
@@ -1059,10 +1140,10 @@ export function registerProbeSearch(pi: ExtensionAPI) {
 		name: "probe_search",
 		label: "Probe Search",
 		description:
-			"Search the codebase with `probe search` to find the most relevant code blocks by intent or concept. Prefer short keyword queries first, not full business questions. Output is truncated to 2000 lines or 50KB.",
-		promptSnippet: "Semantic code search with Probe for concept-level discovery across the repo.",
+			"Search the codebase with `probe search` to find the most relevant code blocks by intent or concept. Defaults are tuned for Java, Maven, JSP, and Spring-style codebases. Prefer short keyword queries first, not full business questions. Output is truncated to 2000 lines or 50KB.",
+		promptSnippet: "Semantic code search with Probe for concept-level discovery across Java/Spring-style repos.",
 		promptGuidelines: [
-			"Start with 2-6 focused keywords, names, or phrases. Do not start with a long natural-language question unless you have no better terms.",
+			"Start with 2-6 focused keywords, names, or phrases. Mix business words with Java identifiers, request types, funCode values, class names, or method names when possible.",
 			"Use exact=true for specific identifiers, quoted phrases, exact Chinese labels, method names, or constants.",
 			"Use files_only=true for a first narrowing pass, then use probe_extract on the best file or path:line hit.",
 			"Prefer output_mode=agent_json unless you explicitly need prose output.",
