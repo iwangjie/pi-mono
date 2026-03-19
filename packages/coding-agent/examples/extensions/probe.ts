@@ -64,16 +64,22 @@ interface ProbeSearchCandidate {
 	score: number;
 	matched_terms: string[];
 	explain: string[];
+	likely_primary_method?: string;
+	call_chain_hint?: string;
+	why_this_is_core?: string[];
 	snippets: ProbeSearchCandidateSnippet[];
 }
 
 interface ProbeSearchPayload {
 	query: string;
 	path: string;
+	expanded_query?: string;
 	execution: {
+		strict_reranker: boolean;
 		requested_reranker: string;
 		applied_reranker: string;
 		fallback_reason?: string;
+		quality_impact: "none" | "low" | "medium" | "high";
 		probe_banner?: string;
 	};
 	filters: {
@@ -81,6 +87,9 @@ interface ProbeSearchPayload {
 		any_term: boolean;
 		allow_tests: boolean;
 		files_only_requested: boolean;
+		code_only: boolean;
+		synonym_expansion: boolean;
+		module_hint: string[];
 		include_globs: string[];
 		exclude_globs: string[];
 	};
@@ -109,6 +118,11 @@ const ProbeSearchParams = Type.Object({
 		Type.String({ description: "Directory or file path to search. Defaults to the current project." }),
 	),
 	reranker: Type.Optional(ProbeReranker),
+	strict_reranker: Type.Optional(
+		Type.Boolean({
+			description: "Require the requested reranker to be applied. If Probe falls back, the tool errors.",
+		}),
+	),
 	exact: Type.Optional(
 		Type.Boolean({
 			description: "Use exact matching. Good for specific method names, identifiers, or quoted phrases.",
@@ -127,6 +141,23 @@ const ProbeSearchParams = Type.Object({
 	allow_tests: Type.Optional(
 		Type.Boolean({
 			description: "Include test files in results.",
+		}),
+	),
+	code_only: Type.Optional(
+		Type.Boolean({
+			description:
+				"Default true. Prefer code files and drop non-code files like jsp, markdown, docs, templates, sql, and configs from final ranked output.",
+		}),
+	),
+	module_hint: Type.Optional(
+		Type.Array(Type.String(), {
+			description: 'Optional module or path hints to boost, for example ["trans-business", "merchant/service"].',
+		}),
+	),
+	synonym_expansion: Type.Optional(
+		Type.Boolean({
+			description:
+				"Default false. Expand a small built-in business synonym set for ranking and query rewriting, for example 自由职业者 -> soho.",
 		}),
 	),
 	include_globs: Type.Optional(
@@ -221,6 +252,34 @@ function splitQueryTerms(query: string): string[] {
 		.slice(0, 12);
 }
 
+const QUERY_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
+	自由职业者: ["soho", "灵工"],
+	soho: ["自由职业者", "灵工"],
+	灵工: ["自由职业者", "soho"],
+	签约: ["签署", "sign", "contract", "signreq", "dobusiness"],
+	签署: ["签约", "sign", "contract"],
+	服务商: ["merchant", "provider"],
+	平台: ["platform"],
+};
+
+function expandQueryTerms(terms: string[], enabled: boolean): string[] {
+	if (!enabled) {
+		return terms;
+	}
+
+	const expanded = new Set<string>(terms);
+	for (const term of terms) {
+		for (const [source, synonyms] of Object.entries(QUERY_SYNONYMS)) {
+			if (term.toLowerCase().includes(source.toLowerCase()) || source.toLowerCase().includes(term.toLowerCase())) {
+				for (const synonym of synonyms) {
+					expanded.add(synonym);
+				}
+			}
+		}
+	}
+	return Array.from(expanded).slice(0, 24);
+}
+
 function countMatches(text: string, terms: string[]): number {
 	const haystack = text.toLowerCase();
 	let count = 0;
@@ -236,6 +295,15 @@ function countMatches(text: string, terms: string[]): number {
 function getMatchedTerms(text: string, terms: string[]): string[] {
 	const haystack = text.toLowerCase();
 	return terms.filter((term) => haystack.includes(term.toLowerCase()));
+}
+
+function isCodeFile(path: string): boolean {
+	return /\.(java|kt|scala|groovy|go|rs|py|ts|tsx|js|jsx|c|cc|cpp|cs)$/i.test(path);
+}
+
+function pathHasAnyHint(path: string, hints: string[]): boolean {
+	const lower = path.toLowerCase();
+	return hints.some((hint) => lower.includes(hint.toLowerCase()));
 }
 
 function clipSnippet(snippet: string, maxLines: number): { text: string; clipped: boolean; totalLines: number } {
@@ -332,10 +400,12 @@ function matchesAnyGlob(path: string, globs: string[]): boolean {
 function determineAppliedReranker(
 	requestedReranker: string,
 	actualRankingLine: string | undefined,
+	strictReranker: boolean,
 ): ProbeSearchPayload["execution"] {
 	const normalizedBanner = actualRankingLine?.toLowerCase() ?? "";
 	let appliedReranker = requestedReranker;
 	let fallbackReason: string | undefined;
+	let qualityImpact: ProbeSearchPayload["execution"]["quality_impact"] = "none";
 
 	for (const candidate of ["hybrid2", "hybrid", "bm25", "tfidf"] as const) {
 		if (normalizedBanner.includes(candidate)) {
@@ -346,12 +416,21 @@ function determineAppliedReranker(
 
 	if (actualRankingLine && appliedReranker !== requestedReranker) {
 		fallbackReason = `Probe banner reported ${appliedReranker} while ${requestedReranker} was requested.`;
+		if (requestedReranker === "hybrid2" && (appliedReranker === "bm25" || appliedReranker === "tfidf")) {
+			qualityImpact = "high";
+		} else if (requestedReranker === "hybrid" && (appliedReranker === "bm25" || appliedReranker === "tfidf")) {
+			qualityImpact = "medium";
+		} else {
+			qualityImpact = "low";
+		}
 	}
 
 	return {
+		strict_reranker: strictReranker,
 		requested_reranker: requestedReranker,
 		applied_reranker: appliedReranker,
 		fallback_reason: fallbackReason,
+		quality_impact: qualityImpact,
 		probe_banner: actualRankingLine,
 	};
 }
@@ -360,6 +439,7 @@ function rankProbeSearchHit(
 	hit: ProbeSearchHit,
 	queryTerms: string[],
 	preferEntrypoints: boolean,
+	moduleHints: string[],
 ): RankedProbeSearchHit {
 	let score = 0;
 	const explain: string[] = [];
@@ -378,7 +458,7 @@ function rankProbeSearchHit(
 		explain.push(`snippet matched ${snippetTermMatches} query term(s)`);
 	}
 
-	if (/\.(java|kt|scala|groovy|go|rs|py|ts|tsx|js|jsx|c|cc|cpp|cs)$/.test(fileLower)) {
+	if (isCodeFile(fileLower)) {
 		score += 4;
 		explain.push("code file");
 	}
@@ -390,14 +470,18 @@ function rankProbeSearchHit(
 		score -= 12;
 		explain.push("non-code or document penalty");
 	}
+	if (moduleHints.length > 0 && pathHasAnyHint(fileLower, moduleHints)) {
+		score += 12;
+		explain.push("module hint boost");
+	}
 
 	if (preferEntrypoints) {
 		if (/(controller|router|route|handler)/i.test(hit.file)) {
-			score += 10;
+			score += 14;
 			explain.push("entrypoint path hint");
 		}
 		if (/(service|serviceimpl|manager|processor|executor|biz)/i.test(hit.file)) {
-			score += 7;
+			score += 10;
 			explain.push("business path hint");
 		}
 		if (
@@ -407,17 +491,22 @@ function rankProbeSearchHit(
 			snippetLower.includes("@restcontroller") ||
 			snippetLower.includes("@controller")
 		) {
-			score += 10;
+			score += 14;
 			explain.push("spring route annotation");
 		}
 		if (
 			snippetLower.includes("dobusiness(") ||
 			snippetLower.includes("process(") ||
 			snippetLower.includes("handle(") ||
-			snippetLower.includes("execute(")
+			snippetLower.includes("execute(") ||
+			snippetLower.includes("dispatch(")
 		) {
-			score += 6;
+			score += 10;
 			explain.push("core-method naming hint");
+		}
+		if (snippetLower.includes("funcode") || snippetLower.includes("signreq")) {
+			score += 10;
+			explain.push("dispatch/request-type hint");
 		}
 	}
 
@@ -433,16 +522,90 @@ function rankProbeSearchHit(
 	};
 }
 
+function deriveLikelyPrimaryMethod(file: string, snippet: string): string | undefined {
+	const classMatch = snippet.match(/\bclass\s+([A-Za-z_][A-Za-z0-9_]*)/);
+	const methodMatches = Array.from(
+		snippet.matchAll(
+			/\b(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?[A-Za-z0-9_<>[\], ?]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)/g,
+		),
+	);
+	const preferred = ["doBusiness", "handle", "process", "execute", "dispatch", "route", "sign"];
+	const picked =
+		methodMatches.find((match) => preferred.some((name) => match[1].toLowerCase().includes(name.toLowerCase()))) ??
+		methodMatches[0];
+	if (!picked) {
+		return undefined;
+	}
+
+	const className =
+		classMatch?.[1] ??
+		file
+			.split("/")
+			.pop()
+			?.replace(/\.[^.]+$/, "");
+	if (!className) {
+		return picked[1];
+	}
+	return `${className}#${picked[1]}(${picked[2].trim()})`;
+}
+
+function deriveCallChainHint(file: string, snippet: string): string | undefined {
+	const fileLower = file.toLowerCase();
+	const snippetLower = snippet.toLowerCase();
+
+	if (
+		/(controller|router|route|handler)/.test(fileLower) ||
+		snippetLower.includes("@requestmapping") ||
+		snippetLower.includes("@getmapping") ||
+		snippetLower.includes("@postmapping")
+	) {
+		return "Controller/Route -> Service";
+	}
+	if (snippetLower.includes("funcode") || snippetLower.includes("enum")) {
+		return "Controller/Route -> Enum/Dispatch -> Handler/Service";
+	}
+	if (/(service|serviceimpl|manager|processor|executor|biz)/.test(fileLower)) {
+		return "Service -> downstream processor/gateway/DAO";
+	}
+	return undefined;
+}
+
+function deriveWhyThisIsCore(hit: RankedProbeSearchHit): string[] {
+	const reasons = [...hit.explain];
+	const snippetLower = hit.snippet.toLowerCase();
+
+	if (
+		snippetLower.includes("@requestmapping") ||
+		snippetLower.includes("@getmapping") ||
+		snippetLower.includes("@postmapping")
+	) {
+		reasons.push("request entry annotation present");
+	}
+	if (snippetLower.includes("funcode")) {
+		reasons.push("funCode-style dispatch present");
+	}
+	if (snippetLower.includes("signreq") || snippetLower.includes("sign")) {
+		reasons.push("signing request vocabulary present");
+	}
+
+	return Array.from(new Set(reasons)).slice(0, 6);
+}
+
 function buildProbeSearchPayload(
 	output: string,
 	query: string,
 	options: {
 		path: string;
+		expandedQuery?: string;
 		reranker: string;
+		strictReranker: boolean;
 		exact: boolean;
 		anyTerm: boolean;
 		allowTests: boolean;
 		filesOnlyRequested: boolean;
+		codeOnly: boolean;
+		synonymExpansion: boolean;
+		moduleHint: string[];
 		includeGlobs: string[];
 		excludeGlobs: string[];
 		preferEntrypoints: boolean;
@@ -456,7 +619,7 @@ function buildProbeSearchPayload(
 		return undefined;
 	}
 
-	const queryTerms = splitQueryTerms(query);
+	const queryTerms = expandQueryTerms(splitQueryTerms(query), options.synonymExpansion);
 	const rankedHits = parsed.hits
 		.filter((hit) => {
 			if (options.includeGlobs.length > 0 && !matchesAnyGlob(hit.file, options.includeGlobs)) {
@@ -465,9 +628,12 @@ function buildProbeSearchPayload(
 			if (matchesAnyGlob(hit.file, options.excludeGlobs)) {
 				return false;
 			}
+			if (options.codeOnly && !isCodeFile(hit.file)) {
+				return false;
+			}
 			return true;
 		})
-		.map((hit) => rankProbeSearchHit(hit, queryTerms, options.preferEntrypoints))
+		.map((hit) => rankProbeSearchHit(hit, queryTerms, options.preferEntrypoints, options.moduleHint))
 		.sort((a, b) => b.score - a.score);
 
 	const fileToHits = new Map<string, RankedProbeSearchHit[]>();
@@ -509,6 +675,9 @@ function buildProbeSearchPayload(
 			score: bestHit.score,
 			matched_terms: matchedTerms,
 			explain: bestHit.explain,
+			likely_primary_method: deriveLikelyPrimaryMethod(file, bestHit.snippet),
+			call_chain_hint: deriveCallChainHint(file, bestHit.snippet),
+			why_this_is_core: deriveWhyThisIsCore(bestHit),
 			snippets,
 		};
 	});
@@ -516,12 +685,16 @@ function buildProbeSearchPayload(
 	return {
 		query,
 		path: options.path,
-		execution: determineAppliedReranker(options.reranker, parsed.actualRankingLine),
+		expanded_query: options.expandedQuery,
+		execution: determineAppliedReranker(options.reranker, parsed.actualRankingLine, options.strictReranker),
 		filters: {
 			exact: options.exact,
 			any_term: options.anyTerm,
 			allow_tests: options.allowTests,
 			files_only_requested: options.filesOnlyRequested,
+			code_only: options.codeOnly,
+			synonym_expansion: options.synonymExpansion,
+			module_hint: options.moduleHint,
 			include_globs: options.includeGlobs,
 			exclude_globs: options.excludeGlobs,
 		},
@@ -549,8 +722,12 @@ function renderSmartProbeSearchResult(payload: ProbeSearchPayload, maxLinesPerSn
 	const lines: string[] = [];
 	lines.push("Probe search summary");
 	lines.push(`- Query: ${payload.query}`);
+	if (payload.expanded_query) {
+		lines.push(`- Expanded query: ${payload.expanded_query}`);
+	}
 	lines.push(`- Requested reranker: ${payload.execution.requested_reranker}`);
 	lines.push(`- Applied reranker: ${payload.execution.applied_reranker}`);
+	lines.push(`- Quality impact: ${payload.execution.quality_impact}`);
 	if (payload.execution.fallback_reason) {
 		lines.push(`- Fallback: ${payload.execution.fallback_reason}`);
 	}
@@ -568,6 +745,15 @@ function renderSmartProbeSearchResult(payload: ProbeSearchPayload, maxLinesPerSn
 			`${index + 1}. ${candidate.file} [${candidate.confidence}] best_span=${candidate.best_span} score=${candidate.score}`,
 		);
 		lines.push(`   explain: ${candidate.explain.join(", ") || "ranked"}`);
+		if (candidate.likely_primary_method) {
+			lines.push(`   likely_primary_method: ${candidate.likely_primary_method}`);
+		}
+		if (candidate.call_chain_hint) {
+			lines.push(`   call_chain_hint: ${candidate.call_chain_hint}`);
+		}
+		if (candidate.why_this_is_core?.length) {
+			lines.push(`   why_this_is_core: ${candidate.why_this_is_core.join(", ")}`);
+		}
 		if (candidate.matched_terms.length > 0) {
 			lines.push(`   matched_terms: ${candidate.matched_terms.join(", ")}`);
 		}
@@ -607,6 +793,22 @@ function appendIncludeGlobsToQuery(query: string, includeGlobs: string[]): strin
 		return `${query} AND ${clauses[0]}`;
 	}
 	return `${query} AND (${clauses.join(" OR ")})`;
+}
+
+function buildExpandedQuery(query: string, synonymExpansion: boolean, includeGlobs: string[]): string {
+	const withInclude = appendIncludeGlobsToQuery(query, includeGlobs);
+	if (!synonymExpansion) {
+		return withInclude;
+	}
+
+	let expanded = withInclude;
+	for (const [term, synonyms] of Object.entries(QUERY_SYNONYMS)) {
+		if (query.includes(term)) {
+			const clause = `(${[term, ...synonyms].join(" OR ")})`;
+			expanded += ` OR ${clause}`;
+		}
+	}
+	return expanded;
 }
 
 function truncateProbeOutput(output: string): { text: string; truncation?: TruncationResult } {
@@ -704,6 +906,7 @@ export default function probeExtension(pi: ExtensionAPI) {
 			"Use exact=true for specific identifiers, quoted phrases, exact Chinese labels, method names, or constants.",
 			"Use files_only=true for a first narrowing pass, then use probe_extract on the best file or path:line hit.",
 			"Prefer output_mode=agent_json unless you explicitly need prose output.",
+			"Keep code_only=true by default when you are looking for implementation entrypoints or core methods.",
 		],
 		parameters: ProbeSearchParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -711,7 +914,11 @@ export default function probeExtension(pi: ExtensionAPI) {
 			const excludeGlobs = params.exclude_globs ?? [];
 			const outputMode = params.output_mode ?? "agent_json";
 			const smart = params.smart !== false && outputMode !== "raw_text";
-			const effectiveQuery = appendIncludeGlobsToQuery(params.query, includeGlobs);
+			const strictReranker = params.strict_reranker === true;
+			const moduleHint = params.module_hint ?? [];
+			const synonymExpansion = params.synonym_expansion === true;
+			const codeOnly = params.code_only !== false;
+			const effectiveQuery = buildExpandedQuery(params.query, synonymExpansion, includeGlobs);
 			const args: string[] = [effectiveQuery];
 			const path = normalizeOptionalString(params.path);
 			const reranker = params.reranker ?? "hybrid";
@@ -755,11 +962,16 @@ export default function probeExtension(pi: ExtensionAPI) {
 
 			const payload = buildProbeSearchPayload(contentText, params.query, {
 				path: path ?? ctx.cwd,
+				expandedQuery: effectiveQuery !== params.query ? effectiveQuery : undefined,
 				reranker,
+				strictReranker,
 				exact: params.exact === true,
 				anyTerm: params.any_term === true,
 				allowTests: params.allow_tests === true,
 				filesOnlyRequested: params.files_only === true,
+				codeOnly,
+				synonymExpansion,
+				moduleHint,
 				includeGlobs,
 				excludeGlobs,
 				preferEntrypoints: params.prefer_entrypoints !== false,
@@ -769,6 +981,14 @@ export default function probeExtension(pi: ExtensionAPI) {
 			});
 			if (!payload) {
 				return result;
+			}
+			if (
+				payload.execution.strict_reranker &&
+				payload.execution.applied_reranker !== payload.execution.requested_reranker
+			) {
+				throw new Error(
+					`probe search strict_reranker failed: requested ${payload.execution.requested_reranker}, applied ${payload.execution.applied_reranker}. ${payload.execution.fallback_reason ?? ""}`.trim(),
+				);
 			}
 
 			const rendered =
@@ -845,6 +1065,9 @@ Probe CLI tools are available:
 - Use probe_search first for discovery. Prefer short targeted keywords, exact identifiers, Chinese labels, or 2-6 term queries instead of long business questions.
 - For probe_search, prefer reranker=hybrid unless you have a reason not to. Use exact=true for specific method names, variables, constants, or exact phrases.
 - For probe_search, prefer output_mode=agent_json so you can read stable fields like execution, candidates, best_span, confidence, and extract_target.
+- For probe_search, keep code_only=true unless you intentionally want docs, config, jsp, sql, or templates.
+- Use module_hint when you already suspect a module or bounded area, for example trans-business.
+- Use strict_reranker=true only when you must guarantee the requested reranker was actually applied.
 - If probe_search finds a promising file or line range, call probe_extract next with file, path:line, path:start-end, or path#symbol.
 - Use probe_query only when you need structural matching. Start loose with placeholders like $NAME, $$$ARGS, $$$BODY.
 - For probe_query, do not hardcode full Java signatures on the first try. Avoid fixing return type, modifiers, annotations, and throws clauses unless required.
