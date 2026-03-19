@@ -1,7 +1,7 @@
 import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { normalizeOptionalString, runProbe, truncateProbeOutput } from "./common.js";
+import { normalizeOptionalString, type ProbeToolDetails, runProbe, truncateProbeOutput } from "./common.js";
 import { loadProjectProbeSynonyms, type ProbeSynonymMap } from "./config.js";
 
 interface ProbeSearchHit {
@@ -40,7 +40,7 @@ interface ProbeSearchCandidate {
 	snippets: ProbeSearchCandidateSnippet[];
 }
 
-interface ProbeSearchPayload {
+export interface ProbeSearchPayload {
 	query: string;
 	path: string;
 	expanded_query?: string;
@@ -212,6 +212,34 @@ export const ProbeSearchParams = Type.Object({
 		}),
 	),
 });
+
+export interface ProbeSearchExecuteOptions {
+	query: string;
+	path?: string;
+	reranker?: "hybrid" | "hybrid2" | "bm25" | "tfidf";
+	auto_retry_reranker?: boolean;
+	strict_reranker?: boolean;
+	exact?: boolean;
+	any_term?: boolean;
+	files_only?: boolean;
+	allow_tests?: boolean;
+	code_only?: boolean;
+	module_hint?: string[];
+	module_scope?: "prefer" | "strict";
+	intent?: "generic" | "core_method";
+	synonym_expansion?: boolean;
+	include_globs?: string[];
+	exclude_globs?: string[];
+	smart?: boolean;
+	output_mode?: "agent_json" | "smart_text" | "raw_text";
+	prefer_entrypoints?: boolean;
+	max_files?: number;
+	max_snippets_per_file?: number;
+	max_lines_per_snippet?: number;
+	max_results?: number;
+	max_bytes?: number;
+	max_tokens?: number;
+}
 
 const BUILTIN_QUERY_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
 	自由职业者: ["soho", "灵工"],
@@ -942,133 +970,147 @@ export function registerProbeSearch(pi: ExtensionAPI) {
 		],
 		parameters: ProbeSearchParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const projectSynonyms = loadProjectProbeSynonyms(ctx.cwd);
-			const synonymMap = mergeSynonyms(projectSynonyms);
-			const includeGlobs = params.include_globs ?? [];
-			const excludeGlobs = params.exclude_globs ?? [];
-			const outputMode = params.output_mode ?? "agent_json";
-			const smart = params.smart !== false && outputMode !== "raw_text";
-			const strictReranker = params.strict_reranker === true;
-			const autoRetryReranker = params.auto_retry_reranker !== false;
-			const moduleHint = params.module_hint ?? [];
-			const moduleScope = params.module_scope ?? "prefer";
-			const intent = params.intent ?? "generic";
-			const synonymExpansion = params.synonym_expansion === true;
-			const codeOnly = params.code_only !== false;
-			const path = normalizeOptionalString(params.path);
-			const reranker = params.reranker ?? "hybrid";
-			const effectiveQuery = buildExpandedQuery(params.query, synonymExpansion, includeGlobs, synonymMap);
-			const rerankerPlan = buildRerankerPlan(reranker, autoRetryReranker);
-			const executionAttempts: ProbeSearchPayload["execution"]["attempts"] = [];
-
-			let result: Awaited<ReturnType<typeof runProbe>> | undefined;
-			for (const requestedAttemptReranker of rerankerPlan) {
-				const args: string[] = [effectiveQuery];
-				if (path) {
-					args.push(path);
-				} else {
-					args.push(".");
-				}
-				args.push("--reranker", requestedAttemptReranker);
-				if (params.exact === true) {
-					args.push("--exact");
-				}
-				if (params.any_term === true) {
-					args.push("--any-term");
-				}
-				if (params.files_only === true && !smart) {
-					args.push("--files-only");
-				}
-				if (params.allow_tests === true) {
-					args.push("--allow-tests");
-				}
-				for (const ignorePattern of excludeGlobs) {
-					args.push("--ignore", ignorePattern);
-				}
-				if (params.max_results !== undefined) {
-					args.push("--max-results", String(params.max_results));
-				}
-				if (params.max_bytes !== undefined) {
-					args.push("--max-bytes", String(params.max_bytes));
-				}
-				if (params.max_tokens !== undefined) {
-					args.push("--max-tokens", String(params.max_tokens));
-				}
-
-				result = await runProbe(pi, "search", args, ctx.cwd, signal);
-				const contentText = result.content[0]?.text ?? "";
-				const parsed = parseProbeSearchHits(contentText);
-				const executionAttempt = createExecutionAttempt(requestedAttemptReranker, parsed.actualRankingLine);
-				executionAttempts.push({
-					requested_reranker: executionAttempt.requested_reranker,
-					applied_reranker: executionAttempt.applied_reranker,
-					probe_banner: executionAttempt.probe_banner,
-					fallback_reason: executionAttempt.fallback_reason,
-					quality_impact: executionAttempt.quality_impact,
-				});
-
-				if (executionAttempt.applied_reranker === requestedAttemptReranker) {
-					break;
-				}
-			}
-
-			if (!result) {
-				throw new Error("probe search failed before producing any result");
-			}
-
-			const contentText = result.content[0]?.text ?? "";
-			if (!smart) {
-				return result;
-			}
-
-			const payload = buildProbeSearchPayload(contentText, params.query, {
-				path: path ?? ctx.cwd,
-				expandedQuery: effectiveQuery !== params.query ? effectiveQuery : undefined,
-				reranker,
-				rerankerPlan,
-				executionAttempts,
-				strictReranker,
-				exact: params.exact === true,
-				anyTerm: params.any_term === true,
-				allowTests: params.allow_tests === true,
-				filesOnlyRequested: params.files_only === true,
-				codeOnly,
-				intent,
-				synonymExpansion,
-				moduleHint,
-				moduleScope,
-				includeGlobs,
-				excludeGlobs,
-				preferEntrypoints: params.prefer_entrypoints !== false,
-				maxFiles: params.max_files ?? 6,
-				maxSnippetsPerFile: params.max_snippets_per_file ?? 1,
-				maxLinesPerSnippet: params.max_lines_per_snippet ?? 24,
-			});
-			if (!payload) {
-				return result;
-			}
-			if (
-				payload.execution.strict_reranker &&
-				payload.execution.applied_reranker !== payload.execution.requested_reranker
-			) {
-				throw new Error(
-					`probe search strict_reranker failed: requested ${payload.execution.requested_reranker}, applied ${payload.execution.applied_reranker}. ${payload.execution.fallback_reason ?? ""}`.trim(),
-				);
-			}
-
-			const rendered =
-				outputMode === "smart_text"
-					? renderSmartProbeSearchResult(payload, params.max_lines_per_snippet ?? 24)
-					: JSON.stringify(payload, null, 2);
-			const smartTruncation = truncateProbeOutput(rendered);
-
-			return {
-				content: [{ type: "text", text: smartTruncation.text }],
-				details: {
-					...result.details,
-					truncation: smartTruncation.truncation ?? result.details.truncation,
-				},
-			};
+			return executeProbeSearch(pi, params, ctx.cwd, signal);
 		},
 	});
+}
+
+export async function executeProbeSearch(
+	pi: ExtensionAPI,
+	options: ProbeSearchExecuteOptions,
+	cwd: string,
+	signal: AbortSignal | undefined,
+): Promise<{
+	content: [{ type: "text"; text: string }];
+	details: ProbeToolDetails;
+	payload?: ProbeSearchPayload;
+}> {
+	const projectSynonyms = loadProjectProbeSynonyms(cwd);
+	const synonymMap = mergeSynonyms(projectSynonyms);
+	const includeGlobs = options.include_globs ?? [];
+	const excludeGlobs = options.exclude_globs ?? [];
+	const outputMode = options.output_mode ?? "agent_json";
+	const smart = options.smart !== false && outputMode !== "raw_text";
+	const strictReranker = options.strict_reranker === true;
+	const autoRetryReranker = options.auto_retry_reranker !== false;
+	const moduleHint = options.module_hint ?? [];
+	const moduleScope = options.module_scope ?? "prefer";
+	const intent = options.intent ?? "generic";
+	const synonymExpansion = options.synonym_expansion === true;
+	const codeOnly = options.code_only !== false;
+	const path = normalizeOptionalString(options.path);
+	const reranker = options.reranker ?? "hybrid";
+	const effectiveQuery = buildExpandedQuery(options.query, synonymExpansion, includeGlobs, synonymMap);
+	const rerankerPlan = buildRerankerPlan(reranker, autoRetryReranker);
+	const executionAttempts: ProbeSearchPayload["execution"]["attempts"] = [];
+
+	let result: Awaited<ReturnType<typeof runProbe>> | undefined;
+	for (const requestedAttemptReranker of rerankerPlan) {
+		const args: string[] = [effectiveQuery];
+		if (path) {
+			args.push(path);
+		} else {
+			args.push(".");
+		}
+		args.push("--reranker", requestedAttemptReranker);
+		if (options.exact === true) {
+			args.push("--exact");
+		}
+		if (options.any_term === true) {
+			args.push("--any-term");
+		}
+		if (options.files_only === true && !smart) {
+			args.push("--files-only");
+		}
+		if (options.allow_tests === true) {
+			args.push("--allow-tests");
+		}
+		for (const ignorePattern of excludeGlobs) {
+			args.push("--ignore", ignorePattern);
+		}
+		if (options.max_results !== undefined) {
+			args.push("--max-results", String(options.max_results));
+		}
+		if (options.max_bytes !== undefined) {
+			args.push("--max-bytes", String(options.max_bytes));
+		}
+		if (options.max_tokens !== undefined) {
+			args.push("--max-tokens", String(options.max_tokens));
+		}
+
+		result = await runProbe(pi, "search", args, cwd, signal);
+		const contentText = result.content[0]?.text ?? "";
+		const parsed = parseProbeSearchHits(contentText);
+		const executionAttempt = createExecutionAttempt(requestedAttemptReranker, parsed.actualRankingLine);
+		executionAttempts.push({
+			requested_reranker: executionAttempt.requested_reranker,
+			applied_reranker: executionAttempt.applied_reranker,
+			probe_banner: executionAttempt.probe_banner,
+			fallback_reason: executionAttempt.fallback_reason,
+			quality_impact: executionAttempt.quality_impact,
+		});
+
+		if (executionAttempt.applied_reranker === requestedAttemptReranker) {
+			break;
+		}
+	}
+
+	if (!result) {
+		throw new Error("probe search failed before producing any result");
+	}
+
+	const contentText = result.content[0]?.text ?? "";
+	if (!smart) {
+		return result;
+	}
+
+	const payload = buildProbeSearchPayload(contentText, options.query, {
+		path: path ?? cwd,
+		expandedQuery: effectiveQuery !== options.query ? effectiveQuery : undefined,
+		reranker,
+		rerankerPlan,
+		executionAttempts,
+		strictReranker,
+		exact: options.exact === true,
+		anyTerm: options.any_term === true,
+		allowTests: options.allow_tests === true,
+		filesOnlyRequested: options.files_only === true,
+		codeOnly,
+		intent,
+		synonymExpansion,
+		moduleHint,
+		moduleScope,
+		includeGlobs,
+		excludeGlobs,
+		preferEntrypoints: options.prefer_entrypoints !== false,
+		maxFiles: options.max_files ?? 6,
+		maxSnippetsPerFile: options.max_snippets_per_file ?? 1,
+		maxLinesPerSnippet: options.max_lines_per_snippet ?? 24,
+	});
+	if (!payload) {
+		return result;
+	}
+	if (
+		payload.execution.strict_reranker &&
+		payload.execution.applied_reranker !== payload.execution.requested_reranker
+	) {
+		throw new Error(
+			`probe search strict_reranker failed: requested ${payload.execution.requested_reranker}, applied ${payload.execution.applied_reranker}. ${payload.execution.fallback_reason ?? ""}`.trim(),
+		);
+	}
+
+	const rendered =
+		outputMode === "smart_text"
+			? renderSmartProbeSearchResult(payload, options.max_lines_per_snippet ?? 24)
+			: JSON.stringify(payload, null, 2);
+	const smartTruncation = truncateProbeOutput(rendered);
+
+	return {
+		content: [{ type: "text", text: smartTruncation.text }],
+		details: {
+			...result.details,
+			truncation: smartTruncation.truncation ?? result.details.truncation,
+		},
+		payload,
+	};
 }

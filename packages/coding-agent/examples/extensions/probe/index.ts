@@ -14,6 +14,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { registerProbeCoreMethod } from "./core-method.js";
 import { registerProbeExtract, registerProbeQuery } from "./query-extract.js";
 import { registerProbeSearch } from "./search.js";
 
@@ -21,6 +22,7 @@ export default function probeExtension(pi: ExtensionAPI) {
 	registerProbeSearch(pi);
 	registerProbeQuery(pi);
 	registerProbeExtract(pi);
+	registerProbeCoreMethod(pi);
 
 	pi.on("before_agent_start", (event) => {
 		return {
@@ -33,6 +35,7 @@ Probe CLI tools are available:
 - For probe_search, prefer reranker=hybrid unless you have a reason not to. Use exact=true for specific method names, variables, constants, or exact phrases.
 - For probe_search, prefer output_mode=agent_json so you can read stable fields like execution, candidates, best_span, confidence, and extract_target.
 - For probe_search, keep code_only=true unless you intentionally want docs, config, jsp, sql, or templates.
+- For "核心方法是哪个" 这类问题， prefer using probe_core_method instead of manually tuning probe_search.
 - Use intent=core_method when the question is "核心方法是哪个" or when you need a Controller/Route -> Service -> DAO style chain.
 - Use module_hint when you already suspect a module or bounded area, for example trans-business.
 - Use module_scope=strict when the module boundary is known and you want Probe to stay inside it.
