@@ -2,6 +2,7 @@ import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { normalizeOptionalString, runProbe, truncateProbeOutput } from "./common.js";
+import { loadProjectProbeSynonyms, type ProbeSynonymMap } from "./config.js";
 
 interface ProbeSearchHit {
 	file: string;
@@ -34,6 +35,8 @@ interface ProbeSearchCandidate {
 	likely_primary_method?: string;
 	call_chain_hint?: string;
 	why_this_is_core?: string[];
+	upstream_routes?: string[];
+	downstream_calls?: string[];
 	snippets: ProbeSearchCandidateSnippet[];
 }
 
@@ -43,11 +46,19 @@ interface ProbeSearchPayload {
 	expanded_query?: string;
 	execution: {
 		strict_reranker: boolean;
+		retry_strategy: string[];
 		requested_reranker: string;
 		applied_reranker: string;
 		fallback_reason?: string;
 		quality_impact: "none" | "low" | "medium" | "high";
 		probe_banner?: string;
+		attempts: Array<{
+			requested_reranker: string;
+			applied_reranker: string;
+			probe_banner?: string;
+			fallback_reason?: string;
+			quality_impact: "none" | "low" | "medium" | "high";
+		}>;
 	};
 	filters: {
 		exact: boolean;
@@ -55,8 +66,10 @@ interface ProbeSearchPayload {
 		allow_tests: boolean;
 		files_only_requested: boolean;
 		code_only: boolean;
+		intent: "generic" | "core_method";
 		synonym_expansion: boolean;
 		module_hint: string[];
+		module_scope: "prefer" | "strict";
 		include_globs: string[];
 		exclude_globs: string[];
 	};
@@ -79,12 +92,27 @@ const ProbeSearchOutputMode = StringEnum(["agent_json", "smart_text", "raw_text"
 		"`agent_json` returns stable machine-friendly fields. `smart_text` returns concise ranked prose. `raw_text` returns Probe's original CLI output.",
 });
 
+const ProbeSearchIntent = StringEnum(["generic", "core_method"] as const, {
+	description:
+		"`core_method` focuses ranking on route/controller/dispatch/service entrypoints and likely business execution methods.",
+});
+
+const ProbeModuleScope = StringEnum(["prefer", "strict"] as const, {
+	description: "`prefer` boosts hinted modules. `strict` filters final candidates to hinted modules only.",
+});
+
 export const ProbeSearchParams = Type.Object({
 	query: Type.String({ description: "Natural-language or keyword query to pass to `probe search`." }),
 	path: Type.Optional(
 		Type.String({ description: "Directory or file path to search. Defaults to the current project." }),
 	),
 	reranker: Type.Optional(ProbeReranker),
+	auto_retry_reranker: Type.Optional(
+		Type.Boolean({
+			description:
+				"Default true. If the requested reranker falls back, retry a small plan such as hybrid -> hybrid2 -> bm25.",
+		}),
+	),
 	strict_reranker: Type.Optional(
 		Type.Boolean({
 			description: "Require the requested reranker to be applied. If Probe falls back, the tool errors.",
@@ -121,6 +149,8 @@ export const ProbeSearchParams = Type.Object({
 			description: 'Optional module or path hints to boost, for example ["trans-business", "merchant/service"].',
 		}),
 	),
+	module_scope: Type.Optional(ProbeModuleScope),
+	intent: Type.Optional(ProbeSearchIntent),
 	synonym_expansion: Type.Optional(
 		Type.Boolean({
 			description:
@@ -183,13 +213,15 @@ export const ProbeSearchParams = Type.Object({
 	),
 });
 
-const QUERY_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
+const BUILTIN_QUERY_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
 	自由职业者: ["soho", "灵工"],
 	soho: ["自由职业者", "灵工"],
 	灵工: ["自由职业者", "soho"],
 	签约: ["签署", "sign", "contract", "signreq", "dobusiness"],
 	签署: ["签约", "sign", "contract"],
 	服务商: ["merchant", "provider"],
+	levy: ["merchant", "服务商"],
+	merchant: ["服务商", "levy"],
 	平台: ["platform"],
 };
 
@@ -201,14 +233,27 @@ function splitQueryTerms(query: string): string[] {
 		.slice(0, 12);
 }
 
-function expandQueryTerms(terms: string[], enabled: boolean): string[] {
+function mergeSynonyms(projectSynonyms: ProbeSynonymMap): ProbeSynonymMap {
+	const merged: ProbeSynonymMap = {};
+
+	for (const [key, values] of Object.entries(BUILTIN_QUERY_SYNONYMS)) {
+		merged[key] = [...values];
+	}
+	for (const [key, values] of Object.entries(projectSynonyms)) {
+		merged[key] = Array.from(new Set([...(merged[key] ?? []), ...values]));
+	}
+
+	return merged;
+}
+
+function expandQueryTerms(terms: string[], enabled: boolean, synonymMap: ProbeSynonymMap): string[] {
 	if (!enabled) {
 		return terms;
 	}
 
 	const expanded = new Set<string>(terms);
 	for (const term of terms) {
-		for (const [source, synonyms] of Object.entries(QUERY_SYNONYMS)) {
+		for (const [source, synonyms] of Object.entries(synonymMap)) {
 			if (term.toLowerCase().includes(source.toLowerCase()) || source.toLowerCase().includes(term.toLowerCase())) {
 				for (const synonym of synonyms) {
 					expanded.add(synonym);
@@ -336,11 +381,16 @@ function matchesAnyGlob(path: string, globs: string[]): boolean {
 	return globs.some((glob) => globToRegExp(glob).test(path));
 }
 
-function determineAppliedReranker(
+function createExecutionAttempt(
 	requestedReranker: string,
 	actualRankingLine: string | undefined,
-	strictReranker: boolean,
-): ProbeSearchPayload["execution"] {
+): {
+	requested_reranker: string;
+	applied_reranker: string;
+	probe_banner?: string;
+	fallback_reason?: string;
+	quality_impact: ProbeSearchPayload["execution"]["quality_impact"];
+} {
 	const normalizedBanner = actualRankingLine?.toLowerCase() ?? "";
 	let appliedReranker = requestedReranker;
 	let fallbackReason: string | undefined;
@@ -365,7 +415,6 @@ function determineAppliedReranker(
 	}
 
 	return {
-		strict_reranker: strictReranker,
 		requested_reranker: requestedReranker,
 		applied_reranker: appliedReranker,
 		fallback_reason: fallbackReason,
@@ -374,11 +423,25 @@ function determineAppliedReranker(
 	};
 }
 
+function buildRerankerPlan(requestedReranker: string, autoRetry: boolean): string[] {
+	if (!autoRetry) {
+		return [requestedReranker];
+	}
+	if (requestedReranker === "hybrid") {
+		return ["hybrid", "hybrid2", "bm25"];
+	}
+	if (requestedReranker === "hybrid2") {
+		return ["hybrid2", "hybrid", "bm25"];
+	}
+	return [requestedReranker];
+}
+
 function rankProbeSearchHit(
 	hit: ProbeSearchHit,
 	queryTerms: string[],
 	preferEntrypoints: boolean,
 	moduleHints: string[],
+	intent: "generic" | "core_method",
 ): RankedProbeSearchHit {
 	let score = 0;
 	const explain: string[] = [];
@@ -449,6 +512,25 @@ function rankProbeSearchHit(
 		}
 	}
 
+	if (intent === "core_method") {
+		if (/(controller|router|route|handler|service|serviceimpl|manager|processor|executor|biz)/i.test(hit.file)) {
+			score += 12;
+			explain.push("core_method intent path boost");
+		}
+		if (
+			snippetLower.includes("@requestmapping") ||
+			snippetLower.includes("@getmapping") ||
+			snippetLower.includes("@postmapping") ||
+			snippetLower.includes("funcode") ||
+			snippetLower.includes("dispatch(") ||
+			snippetLower.includes("execute(") ||
+			snippetLower.includes("dobusiness(")
+		) {
+			score += 16;
+			explain.push("core_method intent chain boost");
+		}
+	}
+
 	if (/(webapp|template|templates|contract|agreement|protocol|docs?|resources)/i.test(hit.file)) {
 		score -= 8;
 		explain.push("document/template/resources path penalty");
@@ -509,6 +591,50 @@ function deriveCallChainHint(file: string, snippet: string): string | undefined 
 	return undefined;
 }
 
+function deriveUpstreamRoutes(file: string, snippet: string): string[] {
+	const results = new Set<string>();
+
+	for (const match of snippet.matchAll(
+		/@(RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping)\(([^)]*)\)/g,
+	)) {
+		const annotation = match[1];
+		const args = match[2];
+		const valueMatch = args.match(/["']([^"']+)["']/);
+		if (valueMatch) {
+			results.add(`${annotation}:${valueMatch[1]}`);
+		} else {
+			results.add(annotation);
+		}
+	}
+
+	for (const match of snippet.matchAll(/\bfunCode\s*[=:]\s*["']?([A-Za-z0-9_:-]+)["']?/g)) {
+		results.add(`funCode:${match[1]}`);
+	}
+
+	if (results.size === 0 && /(controller|router|route|handler)/i.test(file)) {
+		results.add("route-like file path");
+	}
+
+	return Array.from(results).slice(0, 5);
+}
+
+function deriveDownstreamCalls(snippet: string): string[] {
+	const results = new Set<string>();
+	for (const match of snippet.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\(/g)) {
+		const target = `${match[1]}.${match[2]}`;
+		if (
+			target.startsWith("this.") ||
+			target.startsWith("log.") ||
+			target.startsWith("logger.") ||
+			target.startsWith("System.")
+		) {
+			continue;
+		}
+		results.add(target);
+	}
+	return Array.from(results).slice(0, 8);
+}
+
 function deriveWhyThisIsCore(hit: RankedProbeSearchHit): string[] {
 	const reasons = [...hit.explain];
 	const snippetLower = hit.snippet.toLowerCase();
@@ -537,14 +663,18 @@ function buildProbeSearchPayload(
 		path: string;
 		expandedQuery?: string;
 		reranker: string;
+		rerankerPlan: string[];
+		executionAttempts: ProbeSearchPayload["execution"]["attempts"];
 		strictReranker: boolean;
 		exact: boolean;
 		anyTerm: boolean;
 		allowTests: boolean;
 		filesOnlyRequested: boolean;
 		codeOnly: boolean;
+		intent: "generic" | "core_method";
 		synonymExpansion: boolean;
 		moduleHint: string[];
+		moduleScope: "prefer" | "strict";
 		includeGlobs: string[];
 		excludeGlobs: string[];
 		preferEntrypoints: boolean;
@@ -558,7 +688,9 @@ function buildProbeSearchPayload(
 		return undefined;
 	}
 
-	const queryTerms = expandQueryTerms(splitQueryTerms(query), options.synonymExpansion);
+	const projectSynonyms = loadProjectProbeSynonyms(options.path);
+	const synonymMap = mergeSynonyms(projectSynonyms);
+	const queryTerms = expandQueryTerms(splitQueryTerms(query), options.synonymExpansion, synonymMap);
 	const rankedHits = parsed.hits
 		.filter((hit) => {
 			if (options.includeGlobs.length > 0 && !matchesAnyGlob(hit.file, options.includeGlobs)) {
@@ -570,9 +702,16 @@ function buildProbeSearchPayload(
 			if (options.codeOnly && !isCodeFile(hit.file)) {
 				return false;
 			}
+			if (
+				options.moduleScope === "strict" &&
+				options.moduleHint.length > 0 &&
+				!pathHasAnyHint(hit.file, options.moduleHint)
+			) {
+				return false;
+			}
 			return true;
 		})
-		.map((hit) => rankProbeSearchHit(hit, queryTerms, options.preferEntrypoints, options.moduleHint))
+		.map((hit) => rankProbeSearchHit(hit, queryTerms, options.preferEntrypoints, options.moduleHint, options.intent))
 		.sort((a, b) => b.score - a.score);
 
 	const fileToHits = new Map<string, RankedProbeSearchHit[]>();
@@ -617,23 +756,41 @@ function buildProbeSearchPayload(
 			likely_primary_method: deriveLikelyPrimaryMethod(file, bestHit.snippet),
 			call_chain_hint: deriveCallChainHint(file, bestHit.snippet),
 			why_this_is_core: deriveWhyThisIsCore(bestHit),
+			upstream_routes: deriveUpstreamRoutes(file, bestHit.snippet),
+			downstream_calls: deriveDownstreamCalls(bestHit.snippet),
 			snippets,
 		};
 	});
+
+	const finalAttempt =
+		options.executionAttempts[options.executionAttempts.length - 1] ??
+		createExecutionAttempt(options.reranker, parsed.actualRankingLine);
+	const primaryCandidate = candidates[0];
 
 	return {
 		query,
 		path: options.path,
 		expanded_query: options.expandedQuery,
-		execution: determineAppliedReranker(options.reranker, parsed.actualRankingLine, options.strictReranker),
+		execution: {
+			strict_reranker: options.strictReranker,
+			retry_strategy: options.rerankerPlan,
+			requested_reranker: options.reranker,
+			applied_reranker: finalAttempt.applied_reranker,
+			fallback_reason: finalAttempt.fallback_reason,
+			quality_impact: finalAttempt.quality_impact,
+			probe_banner: finalAttempt.probe_banner,
+			attempts: options.executionAttempts,
+		},
 		filters: {
 			exact: options.exact,
 			any_term: options.anyTerm,
 			allow_tests: options.allowTests,
 			files_only_requested: options.filesOnlyRequested,
 			code_only: options.codeOnly,
+			intent: options.intent,
 			synonym_expansion: options.synonymExpansion,
 			module_hint: options.moduleHint,
+			module_scope: options.moduleScope,
 			include_globs: options.includeGlobs,
 			exclude_globs: options.excludeGlobs,
 		},
@@ -644,9 +801,15 @@ function buildProbeSearchPayload(
 			returned_files: candidates.length,
 		},
 		candidates,
-		suggestions: candidates.length
+		suggestions: primaryCandidate
 			? [
-					`Next best action: probe_extract ${candidates[0].extract_target}`,
+					`Next best action: probe_extract ${primaryCandidate.extract_target}`,
+					(primaryCandidate.upstream_routes?.length ?? 0) > 0
+						? "If you need entrypoint proof, continue by extracting the route/funCode carrier or enum next."
+						: "If you need stronger routing evidence, continue by extracting the nearest controller/handler candidate.",
+					(primaryCandidate.downstream_calls?.length ?? 0) > 0
+						? "If you need execution proof, continue by extracting the first downstream service/dao call target."
+						: "If you need execution proof, continue by extracting the target service implementation next.",
 					options.filesOnlyRequested
 						? "If file ranking is still noisy, tighten include_globs/exclude_globs or use exact=true."
 						: "If results are noisy, retry with files_only=true or tighter include_globs/exclude_globs.",
@@ -667,6 +830,7 @@ function renderSmartProbeSearchResult(payload: ProbeSearchPayload, maxLinesPerSn
 	lines.push(`- Requested reranker: ${payload.execution.requested_reranker}`);
 	lines.push(`- Applied reranker: ${payload.execution.applied_reranker}`);
 	lines.push(`- Quality impact: ${payload.execution.quality_impact}`);
+	lines.push(`- Retry strategy: ${payload.execution.retry_strategy.join(" -> ")}`);
 	if (payload.execution.fallback_reason) {
 		lines.push(`- Fallback: ${payload.execution.fallback_reason}`);
 	}
@@ -692,6 +856,12 @@ function renderSmartProbeSearchResult(payload: ProbeSearchPayload, maxLinesPerSn
 		}
 		if (candidate.why_this_is_core?.length) {
 			lines.push(`   why_this_is_core: ${candidate.why_this_is_core.join(", ")}`);
+		}
+		if (candidate.upstream_routes?.length) {
+			lines.push(`   upstream_routes: ${candidate.upstream_routes.join(", ")}`);
+		}
+		if (candidate.downstream_calls?.length) {
+			lines.push(`   downstream_calls: ${candidate.downstream_calls.join(", ")}`);
 		}
 		if (candidate.matched_terms.length > 0) {
 			lines.push(`   matched_terms: ${candidate.matched_terms.join(", ")}`);
@@ -734,14 +904,19 @@ function appendIncludeGlobsToQuery(query: string, includeGlobs: string[]): strin
 	return `${query} AND (${clauses.join(" OR ")})`;
 }
 
-function buildExpandedQuery(query: string, synonymExpansion: boolean, includeGlobs: string[]): string {
+function buildExpandedQuery(
+	query: string,
+	synonymExpansion: boolean,
+	includeGlobs: string[],
+	synonymMap: ProbeSynonymMap,
+): string {
 	const withInclude = appendIncludeGlobsToQuery(query, includeGlobs);
 	if (!synonymExpansion) {
 		return withInclude;
 	}
 
 	let expanded = withInclude;
-	for (const [term, synonyms] of Object.entries(QUERY_SYNONYMS)) {
+	for (const [term, synonyms] of Object.entries(synonymMap)) {
 		if (query.includes(term)) {
 			const clause = `(${[term, ...synonyms].join(" OR ")})`;
 			expanded += ` OR ${clause}`;
@@ -763,54 +938,84 @@ export function registerProbeSearch(pi: ExtensionAPI) {
 			"Use files_only=true for a first narrowing pass, then use probe_extract on the best file or path:line hit.",
 			"Prefer output_mode=agent_json unless you explicitly need prose output.",
 			"Keep code_only=true by default when you are looking for implementation entrypoints or core methods.",
+			"Use intent=core_method for controller/router/dispatch/service entrypoint problems instead of generic semantic search.",
 		],
 		parameters: ProbeSearchParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const projectSynonyms = loadProjectProbeSynonyms(ctx.cwd);
+			const synonymMap = mergeSynonyms(projectSynonyms);
 			const includeGlobs = params.include_globs ?? [];
 			const excludeGlobs = params.exclude_globs ?? [];
 			const outputMode = params.output_mode ?? "agent_json";
 			const smart = params.smart !== false && outputMode !== "raw_text";
 			const strictReranker = params.strict_reranker === true;
+			const autoRetryReranker = params.auto_retry_reranker !== false;
 			const moduleHint = params.module_hint ?? [];
+			const moduleScope = params.module_scope ?? "prefer";
+			const intent = params.intent ?? "generic";
 			const synonymExpansion = params.synonym_expansion === true;
 			const codeOnly = params.code_only !== false;
-			const effectiveQuery = buildExpandedQuery(params.query, synonymExpansion, includeGlobs);
-			const args: string[] = [effectiveQuery];
 			const path = normalizeOptionalString(params.path);
 			const reranker = params.reranker ?? "hybrid";
+			const effectiveQuery = buildExpandedQuery(params.query, synonymExpansion, includeGlobs, synonymMap);
+			const rerankerPlan = buildRerankerPlan(reranker, autoRetryReranker);
+			const executionAttempts: ProbeSearchPayload["execution"]["attempts"] = [];
 
-			if (path) {
-				args.push(path);
-			} else {
-				args.push(".");
-			}
-			args.push("--reranker", reranker);
-			if (params.exact === true) {
-				args.push("--exact");
-			}
-			if (params.any_term === true) {
-				args.push("--any-term");
-			}
-			if (params.files_only === true && !smart) {
-				args.push("--files-only");
-			}
-			if (params.allow_tests === true) {
-				args.push("--allow-tests");
-			}
-			for (const ignorePattern of excludeGlobs) {
-				args.push("--ignore", ignorePattern);
-			}
-			if (params.max_results !== undefined) {
-				args.push("--max-results", String(params.max_results));
-			}
-			if (params.max_bytes !== undefined) {
-				args.push("--max-bytes", String(params.max_bytes));
-			}
-			if (params.max_tokens !== undefined) {
-				args.push("--max-tokens", String(params.max_tokens));
+			let result: Awaited<ReturnType<typeof runProbe>> | undefined;
+			for (const requestedAttemptReranker of rerankerPlan) {
+				const args: string[] = [effectiveQuery];
+				if (path) {
+					args.push(path);
+				} else {
+					args.push(".");
+				}
+				args.push("--reranker", requestedAttemptReranker);
+				if (params.exact === true) {
+					args.push("--exact");
+				}
+				if (params.any_term === true) {
+					args.push("--any-term");
+				}
+				if (params.files_only === true && !smart) {
+					args.push("--files-only");
+				}
+				if (params.allow_tests === true) {
+					args.push("--allow-tests");
+				}
+				for (const ignorePattern of excludeGlobs) {
+					args.push("--ignore", ignorePattern);
+				}
+				if (params.max_results !== undefined) {
+					args.push("--max-results", String(params.max_results));
+				}
+				if (params.max_bytes !== undefined) {
+					args.push("--max-bytes", String(params.max_bytes));
+				}
+				if (params.max_tokens !== undefined) {
+					args.push("--max-tokens", String(params.max_tokens));
+				}
+
+				result = await runProbe(pi, "search", args, ctx.cwd, signal);
+				const contentText = result.content[0]?.text ?? "";
+				const parsed = parseProbeSearchHits(contentText);
+				const executionAttempt = createExecutionAttempt(requestedAttemptReranker, parsed.actualRankingLine);
+				executionAttempts.push({
+					requested_reranker: executionAttempt.requested_reranker,
+					applied_reranker: executionAttempt.applied_reranker,
+					probe_banner: executionAttempt.probe_banner,
+					fallback_reason: executionAttempt.fallback_reason,
+					quality_impact: executionAttempt.quality_impact,
+				});
+
+				if (executionAttempt.applied_reranker === requestedAttemptReranker) {
+					break;
+				}
 			}
 
-			const result = await runProbe(pi, "search", args, ctx.cwd, signal);
+			if (!result) {
+				throw new Error("probe search failed before producing any result");
+			}
+
 			const contentText = result.content[0]?.text ?? "";
 			if (!smart) {
 				return result;
@@ -820,14 +1025,18 @@ export function registerProbeSearch(pi: ExtensionAPI) {
 				path: path ?? ctx.cwd,
 				expandedQuery: effectiveQuery !== params.query ? effectiveQuery : undefined,
 				reranker,
+				rerankerPlan,
+				executionAttempts,
 				strictReranker,
 				exact: params.exact === true,
 				anyTerm: params.any_term === true,
 				allowTests: params.allow_tests === true,
 				filesOnlyRequested: params.files_only === true,
 				codeOnly,
+				intent,
 				synonymExpansion,
 				moduleHint,
+				moduleScope,
 				includeGlobs,
 				excludeGlobs,
 				preferEntrypoints: params.prefer_entrypoints !== false,
