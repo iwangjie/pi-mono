@@ -20,7 +20,7 @@
 docker build -t pi-elegant-base -<<'EOF'
 FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ripgrep bubblewrap socat \
+    ripgrep bubblewrap socat && npm install -g @buger/probe@latest \
  && rm -rf /var/lib/apt/lists/*
 EOF
 ```
