@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { normalizeOptionalString, runProbe, truncateProbeOutput } from "./common.js";
 import { executeProbeSearch, type ProbeSearchPayload } from "./search.js";
+import { maybeTranslateProbeTerms, type ProbeTranslationResult } from "./translate.js";
 
 interface ProbeCoreMethodDetails {
 	query: string;
@@ -47,7 +48,8 @@ const ProbeCoreMethodParams = Type.Object({
 	),
 	synonym_expansion: Type.Optional(
 		Type.Boolean({
-			description: "Default true. Expand business synonyms before ranking.",
+			description:
+				"Default true. Expand generic Java/Spring synonyms plus optional project-level synonyms before ranking.",
 		}),
 	),
 	include_globs: Type.Optional(Type.Array(Type.String())),
@@ -74,10 +76,13 @@ function uniqueStrings(values: string[]): string[] {
 	return Array.from(new Set(values.filter((value) => value.trim().length > 0)));
 }
 
-function buildCoreMethodQueryVariants(query: string): Array<{ stage: string; query: string }> {
+function buildCoreMethodQueryVariants(
+	query: string,
+	translatedTerms: string[] = [],
+): Array<{ stage: string; query: string }> {
 	const rawTerms = splitCoreQueryTerms(query);
 	const focusedTerms = rawTerms.filter((term) => !CORE_QUERY_STOPWORDS.has(term)).slice(0, 4);
-	const semanticTerms = [...focusedTerms];
+	const semanticTerms = [...focusedTerms, ...translatedTerms.slice(0, 3)];
 	const chainTerms: string[] = [];
 
 	const lowerQuery = query.toLowerCase();
@@ -111,6 +116,9 @@ function buildCoreMethodQueryVariants(query: string): Array<{ stage: string; que
 		lowerQuery.includes("dto")
 	) {
 		chainTerms.push("Request", "Req", "DTO");
+	}
+	if (translatedTerms.length > 0) {
+		chainTerms.push(...translatedTerms.slice(0, 4));
 	}
 
 	const focusedQuery = uniqueStrings([...focusedTerms, ...semanticTerms])
@@ -405,6 +413,7 @@ function buildRecommendedNextActions(candidate: CoreMethodCandidate | undefined,
 
 function renderCoreMethodPayload(payload: {
 	query: string;
+	translation: ProbeTranslationResult;
 	query_variants: Array<{ stage: string; query: string }>;
 	workflow: CoreMethodWorkflowStep[];
 	primary_failure_reason?: string;
@@ -428,13 +437,15 @@ export function registerProbeCoreMethod(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use this first when the user asks which method, handler, service, or route is the core execution path.",
 			"If the module boundary is known, pass module_hint. The tool starts from prefer-style narrowing and only tightens further when that helps.",
+			"If the query is mostly Chinese business wording and lacks identifiers, this workflow may add a small English term expansion automatically. If translation fails, the normal Probe flow still continues.",
 		],
 		parameters: ProbeCoreMethodParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const searchPath = normalizeOptionalString(params.path) ?? ctx.cwd;
 			const moduleHint = params.module_hint ?? [];
 			const moduleScope = params.module_scope ?? "prefer";
-			const queryVariants = buildCoreMethodQueryVariants(params.query);
+			const translation = await maybeTranslateProbeTerms(params.query, signal);
+			const queryVariants = buildCoreMethodQueryVariants(params.query, translation.translated_terms);
 			const workflow: CoreMethodWorkflowStep[] = [];
 			const mergedCandidates = new Map<string, CoreMethodCandidate>();
 			let primaryFailureReason: string | undefined;
@@ -559,6 +570,7 @@ export function registerProbeCoreMethod(pi: ExtensionAPI) {
 
 			const output = renderCoreMethodPayload({
 				query: params.query,
+				translation,
 				query_variants: queryVariants,
 				workflow,
 				primary_failure_reason: primaryFailureReason,

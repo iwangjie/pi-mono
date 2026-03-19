@@ -602,7 +602,11 @@ function rankProbeSearchHit(
 			score += 10;
 			explain.push("core-method naming hint");
 		}
-		if (snippetLower.includes("funcode") || snippetLower.includes("signreq")) {
+		if (
+			snippetLower.includes("funcode") ||
+			snippetLower.includes("request") ||
+			/\b[a-z0-9_]*req\b/.test(snippetLower)
+		) {
 			score += 10;
 			explain.push("dispatch/request-type hint");
 		}
@@ -752,8 +756,8 @@ function deriveWhyThisIsCore(hit: RankedProbeSearchHit): string[] {
 	if (snippetLower.includes("executebusiness(")) {
 		reasons.push("executeBusiness-style orchestration present");
 	}
-	if (snippetLower.includes("signreq") || snippetLower.includes("sign")) {
-		reasons.push("signing request vocabulary present");
+	if (snippetLower.includes("request") || /\b[a-z0-9_]*req\b/.test(snippetLower)) {
+		reasons.push("request-type vocabulary present");
 	}
 
 	return Array.from(new Set(reasons)).slice(0, 6);
