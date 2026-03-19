@@ -78,8 +78,8 @@ function parseJsonContent(content: string): unknown {
 }
 
 function resolveDeeplxTranslateUrl(): string | undefined {
-	const configuredBaseUrl = process.env.PI_PROBE_TRANSLATE_DEEPLX_BASE_URL?.trim() || PROBE_DEEPLX_BASE_URL;
-	const deeplxKey = process.env.PI_PROBE_TRANSLATE_DEEPLX_KEY?.trim();
+	const configuredBaseUrl = process.env.PI_CHAT_TRANSLATE_DEEPLX_BASE_URL?.trim() || PROBE_DEEPLX_BASE_URL;
+	const deeplxKey = process.env.PI_CHAT_TRANSLATE_DEEPLX_KEY?.trim();
 	if (!deeplxKey) {
 		return undefined;
 	}
@@ -258,7 +258,7 @@ export async function maybeTranslateProbeTerms(
 	signal?.addEventListener("abort", abortListener, { once: true });
 
 	try {
-		const apiKey = process.env.PI_PROBE_TRANSLATE_API_KEY?.trim();
+		const apiKey = process.env.PI_CHAT_TRANSLATE_API_KEY?.trim();
 		if (apiKey) {
 			const llmResult = await translateWithLlm(query, apiKey, controller.signal, sourceLanguage);
 			if (llmResult.applied) {
