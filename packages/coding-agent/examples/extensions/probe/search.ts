@@ -1,40 +1,7 @@
-/**
- * Probe CLI Extension
- *
- * Registers three local CLI-backed tools:
- * - probe_search  -> `probe search`
- * - probe_query   -> `probe query`
- * - probe_extract -> `probe extract`
- *
- * Usage:
- * 1. Install Probe CLI: npm install -g @buger/probe@latest
- * 2. Load this extension with `--extension` or copy it into an extensions directory
- *
- * This example intentionally uses the local Probe CLI directly. It does not use MCP.
- */
-
 import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import {
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
-	formatSize,
-	type TruncationResult,
-	truncateHead,
-} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-
-const PROBE_TIMEOUT_MS = 120_000;
-
-type ProbeSubcommand = "search" | "query" | "extract";
-
-interface ProbeToolDetails {
-	subcommand: ProbeSubcommand;
-	args: string[];
-	cwd: string;
-	exitCode: number;
-	truncation?: TruncationResult;
-}
+import { normalizeOptionalString, runProbe, truncateProbeOutput } from "./common.js";
 
 interface ProbeSearchHit {
 	file: string;
@@ -112,7 +79,7 @@ const ProbeSearchOutputMode = StringEnum(["agent_json", "smart_text", "raw_text"
 		"`agent_json` returns stable machine-friendly fields. `smart_text` returns concise ranked prose. `raw_text` returns Probe's original CLI output.",
 });
 
-const ProbeSearchParams = Type.Object({
+export const ProbeSearchParams = Type.Object({
 	query: Type.String({ description: "Natural-language or keyword query to pass to `probe search`." }),
 	path: Type.Optional(
 		Type.String({ description: "Directory or file path to search. Defaults to the current project." }),
@@ -216,42 +183,6 @@ const ProbeSearchParams = Type.Object({
 	),
 });
 
-const ProbeQueryParams = Type.Object({
-	pattern: Type.String({
-		description: "Structural query pattern for `probe query`, for example `function $NAME($$$PARAMS) $$$BODY`.",
-	}),
-	path: Type.Optional(
-		Type.String({ description: "Directory or file path to search. Defaults to the current project." }),
-	),
-	language: Type.Optional(Type.String({ description: "Language hint passed to `--language` when needed." })),
-	max_results: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of matches to return." })),
-	strategy: Type.Optional(
-		StringEnum(["loose", "strict"] as const, {
-			description:
-				"`loose` means start with a minimal pattern and placeholders. `strict` means the pattern is already precise.",
-		}),
-	),
-});
-
-const ProbeExtractParams = Type.Object({
-	target: Type.String({
-		description: "Target for `probe extract`, usually a file path or `path:line` location.",
-	}),
-});
-
-function normalizeOptionalString(value: string | undefined): string | undefined {
-	const trimmed = value?.trim();
-	return trimmed ? trimmed : undefined;
-}
-
-function splitQueryTerms(query: string): string[] {
-	return query
-		.split(/[\s,，。;；:：/|()[\]{}"'`<>!?！？]+/)
-		.map((term) => term.trim())
-		.filter((term) => term.length >= 2)
-		.slice(0, 12);
-}
-
 const QUERY_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
 	自由职业者: ["soho", "灵工"],
 	soho: ["自由职业者", "灵工"],
@@ -261,6 +192,14 @@ const QUERY_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
 	服务商: ["merchant", "provider"],
 	平台: ["platform"],
 };
+
+function splitQueryTerms(query: string): string[] {
+	return query
+		.split(/[\s,，。;；:：/|()[\]{}"'`<>!?！？]+/)
+		.map((term) => term.trim())
+		.filter((term) => term.length >= 2)
+		.slice(0, 12);
+}
 
 function expandQueryTerms(terms: string[], enabled: boolean): string[] {
 	if (!enabled) {
@@ -811,90 +750,7 @@ function buildExpandedQuery(query: string, synonymExpansion: boolean, includeGlo
 	return expanded;
 }
 
-function truncateProbeOutput(output: string): { text: string; truncation?: TruncationResult } {
-	if (!output.trim()) {
-		return { text: "Probe returned no output." };
-	}
-
-	const truncation = truncateHead(output, {
-		maxLines: DEFAULT_MAX_LINES,
-		maxBytes: DEFAULT_MAX_BYTES,
-	});
-
-	let text = truncation.content;
-	if (truncation.truncated) {
-		text += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(
-			truncation.outputBytes,
-		)} of ${formatSize(truncation.totalBytes)}).]`;
-	}
-
-	return {
-		text,
-		truncation: truncation.truncated ? truncation : undefined,
-	};
-}
-
-function formatCombinedOutput(stdout: string, stderr: string): string {
-	const trimmedStdout = stdout.trim();
-	const trimmedStderr = stderr.trim();
-
-	if (trimmedStdout && trimmedStderr) {
-		return `${trimmedStdout}\n\n[stderr]\n${trimmedStderr}`;
-	}
-	if (trimmedStdout) {
-		return trimmedStdout;
-	}
-	if (trimmedStderr) {
-		return trimmedStderr;
-	}
-	return "";
-}
-
-function formatProbeError(subcommand: ProbeSubcommand, stderr: string, stdout: string): string {
-	const combined = formatCombinedOutput(stdout, stderr);
-	if (combined) {
-		return `probe ${subcommand} failed:\n${combined}`;
-	}
-	return `probe ${subcommand} failed. Make sure the \`probe\` CLI is installed and available on PATH.`;
-}
-
-async function runProbe(
-	pi: ExtensionAPI,
-	subcommand: ProbeSubcommand,
-	args: string[],
-	cwd: string,
-	signal: AbortSignal | undefined,
-): Promise<{ content: [{ type: "text"; text: string }]; details: ProbeToolDetails }> {
-	const result = await pi.exec("probe", [subcommand, ...args], {
-		cwd,
-		signal,
-		timeout: PROBE_TIMEOUT_MS,
-	});
-
-	if (result.killed) {
-		throw new Error(`probe ${subcommand} was aborted or timed out after ${PROBE_TIMEOUT_MS}ms.`);
-	}
-
-	if (result.code !== 0) {
-		throw new Error(formatProbeError(subcommand, result.stderr, result.stdout));
-	}
-
-	const output = formatCombinedOutput(result.stdout, result.stderr);
-	const truncated = truncateProbeOutput(output);
-
-	return {
-		content: [{ type: "text", text: truncated.text }],
-		details: {
-			subcommand,
-			args,
-			cwd,
-			exitCode: result.code,
-			truncation: truncated.truncation,
-		},
-	};
-}
-
-export default function probeExtension(pi: ExtensionAPI) {
+export function registerProbeSearch(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "probe_search",
 		label: "Probe Search",
@@ -1005,74 +861,5 @@ export default function probeExtension(pi: ExtensionAPI) {
 				},
 			};
 		},
-	});
-
-	pi.registerTool({
-		name: "probe_query",
-		label: "Probe Query",
-		description:
-			"Run `probe query` for structural code matching when you know the code shape you want. Start with a loose pattern unless you already know the exact syntax. Output is truncated to 2000 lines or 50KB.",
-		promptSnippet: "Structural code search with Probe when you know the AST or syntax pattern to match.",
-		promptGuidelines: [
-			"Use this after search or extract narrowed the area, or when you already know the syntax shape to match.",
-			"Default to loose patterns first: prefer placeholders like $NAME, $$$ARGS, $$$BODY and avoid hardcoding modifiers, return types, throws clauses, and annotations unless necessary.",
-			"If a strict query returns no results, relax it instead of retrying the same full signature shape.",
-		],
-		parameters: ProbeQueryParams,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const args: string[] = [params.pattern];
-			const path = normalizeOptionalString(params.path);
-			const language = normalizeOptionalString(params.language);
-
-			if (path) {
-				args.push(path);
-			} else {
-				args.push(".");
-			}
-			if (language) {
-				args.push("--language", language);
-			}
-			if (params.max_results !== undefined) {
-				args.push("--max-results", String(params.max_results));
-			}
-
-			return runProbe(pi, "query", args, ctx.cwd, signal);
-		},
-	});
-
-	pi.registerTool({
-		name: "probe_extract",
-		label: "Probe Extract",
-		description:
-			"Run `probe extract` to extract the closest useful code block for a specific file path, `path:line`, `path:start-end`, or `path#symbol` target. Output is truncated to 2000 lines or 50KB.",
-		promptSnippet: "Precise AST-aware extraction with Probe for a specific file or path:line location.",
-		promptGuidelines: [
-			"Use this immediately after search/query identifies a likely file or hit. Prefer extract over broad re-search when you already have a concrete location.",
-		],
-		parameters: ProbeExtractParams,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			return runProbe(pi, "extract", [params.target], ctx.cwd, signal);
-		},
-	});
-
-	pi.on("before_agent_start", (event) => {
-		return {
-			systemPrompt:
-				event.systemPrompt +
-				`
-
-Probe CLI tools are available:
-- Use probe_search first for discovery. Prefer short targeted keywords, exact identifiers, Chinese labels, or 2-6 term queries instead of long business questions.
-- For probe_search, prefer reranker=hybrid unless you have a reason not to. Use exact=true for specific method names, variables, constants, or exact phrases.
-- For probe_search, prefer output_mode=agent_json so you can read stable fields like execution, candidates, best_span, confidence, and extract_target.
-- For probe_search, keep code_only=true unless you intentionally want docs, config, jsp, sql, or templates.
-- Use module_hint when you already suspect a module or bounded area, for example trans-business.
-- Use strict_reranker=true only when you must guarantee the requested reranker was actually applied.
-- If probe_search finds a promising file or line range, call probe_extract next with file, path:line, path:start-end, or path#symbol.
-- Use probe_query only when you need structural matching. Start loose with placeholders like $NAME, $$$ARGS, $$$BODY.
-- For probe_query, do not hardcode full Java signatures on the first try. Avoid fixing return type, modifiers, annotations, and throws clauses unless required.
-- These tools call the local Probe CLI directly. Do not assume MCP is involved.
-`,
-		};
 	});
 }
