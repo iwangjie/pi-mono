@@ -925,6 +925,14 @@ export type MessageRenderer<T = unknown> = (
 	theme: Theme,
 ) => Component | undefined;
 
+/**
+ * Synchronous display-only transformer for messages.
+ *
+ * Used by TUI/print rendering paths to alter what the user sees without
+ * mutating session state or LLM context.
+ */
+export type MessageDisplayTransformer = (message: AgentMessage) => AgentMessage | undefined;
+
 // ============================================================================
 // Command Registration
 // ============================================================================
@@ -1034,6 +1042,9 @@ export interface ExtensionAPI {
 
 	/** Register a custom renderer for CustomMessageEntry. */
 	registerMessageRenderer<T = unknown>(customType: string, renderer: MessageRenderer<T>): void;
+
+	/** Register a display-only message transformer for TUI/print output. */
+	registerMessageDisplayTransformer(transformer: MessageDisplayTransformer): void;
 
 	// =========================================================================
 	// Actions
@@ -1386,6 +1397,7 @@ export interface Extension {
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
+	messageDisplayTransformers: MessageDisplayTransformer[];
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;

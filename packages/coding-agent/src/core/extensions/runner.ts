@@ -457,6 +457,22 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
+	transformMessageForDisplay(message: AgentMessage): AgentMessage {
+		const transformers = this.extensions.flatMap((ext) => ext.messageDisplayTransformers);
+		if (transformers.length === 0) {
+			return message;
+		}
+
+		let currentMessage = structuredClone(message);
+		for (const transformer of transformers) {
+			const transformed = transformer(currentMessage);
+			if (transformed) {
+				currentMessage = transformed;
+			}
+		}
+		return currentMessage;
+	}
+
 	getRegisteredCommands(reserved?: Set<string>): RegisteredCommand[] {
 		this.commandDiagnostics = [];
 

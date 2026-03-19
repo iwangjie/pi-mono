@@ -32,6 +32,7 @@ import type {
 	ExtensionFactory,
 	ExtensionRuntime,
 	LoadExtensionsResult,
+	MessageDisplayTransformer,
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
@@ -207,6 +208,10 @@ function createExtensionAPI(
 			extension.messageRenderers.set(customType, renderer as MessageRenderer);
 		},
 
+		registerMessageDisplayTransformer(transformer: MessageDisplayTransformer): void {
+			extension.messageDisplayTransformers.push(transformer);
+		},
+
 		// Flag access - checks extension registered it, reads from runtime
 		getFlag(name: string): boolean | string | undefined {
 			if (!extension.flags.has(name)) return undefined;
@@ -308,6 +313,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		handlers: new Map(),
 		tools: new Map(),
 		messageRenderers: new Map(),
+		messageDisplayTransformers: [],
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),

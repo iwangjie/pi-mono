@@ -90,6 +90,7 @@ export type {
 	KeybindingsManager,
 	LoadExtensionsResult,
 	LsToolCallEvent,
+	MessageDisplayTransformer,
 	MessageRenderer,
 	MessageRenderOptions,
 	ProviderConfig,

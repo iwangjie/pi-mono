@@ -29,6 +29,10 @@ export interface PrintModeOptions {
  */
 export async function runPrintMode(session: AgentSession, options: PrintModeOptions): Promise<void> {
 	const { mode, messages = [], initialMessage, initialImages } = options;
+	const transformMessageForDisplay = <T extends AssistantMessage>(message: T): T => {
+		return (session.extensionRunner?.transformMessageForDisplay(message) ?? message) as T;
+	};
+
 	if (mode === "json") {
 		const header = session.sessionManager.getHeader();
 		if (header) {
@@ -96,7 +100,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		const lastMessage = state.messages[state.messages.length - 1];
 
 		if (lastMessage?.role === "assistant") {
-			const assistantMsg = lastMessage as AssistantMessage;
+			const assistantMsg = transformMessageForDisplay(lastMessage as AssistantMessage);
 
 			// Check for error/aborted
 			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {

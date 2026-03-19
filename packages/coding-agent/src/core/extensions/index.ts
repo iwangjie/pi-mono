@@ -83,6 +83,7 @@ export type {
 	LoadExtensionsResult,
 	LsToolCallEvent,
 	LsToolResultEvent,
+	MessageDisplayTransformer,
 	// Events - Message
 	MessageEndEvent,
 	// Message Rendering

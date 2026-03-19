@@ -2181,7 +2181,7 @@ export class InteractiveMode {
 						this.hideThinkingBlock,
 						this.getMarkdownThemeWithSettings(),
 					);
-					this.streamingMessage = event.message;
+					this.streamingMessage = this.transformMessageForDisplay(event.message);
 					this.chatContainer.addChild(this.streamingComponent);
 					this.streamingComponent.updateContent(this.streamingMessage);
 					this.ui.requestRender();
@@ -2190,10 +2190,10 @@ export class InteractiveMode {
 
 			case "message_update":
 				if (this.streamingComponent && event.message.role === "assistant") {
-					this.streamingMessage = event.message;
+					this.streamingMessage = this.transformMessageForDisplay(event.message);
 					this.streamingComponent.updateContent(this.streamingMessage);
 
-					for (const content of this.streamingMessage.content) {
+					for (const content of event.message.content) {
 						if (content.type === "toolCall") {
 							if (!this.pendingTools.has(content.id)) {
 								const component = new ToolExecutionComponent(
@@ -2223,7 +2223,7 @@ export class InteractiveMode {
 			case "message_end":
 				if (event.message.role === "user") break;
 				if (this.streamingComponent && event.message.role === "assistant") {
-					this.streamingMessage = event.message;
+					this.streamingMessage = this.transformMessageForDisplay(event.message);
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
 						const retryAttempt = this.session.retryAttempt;
@@ -2425,6 +2425,20 @@ export class InteractiveMode {
 		return textBlocks.map((c) => (c as { text: string }).text).join("");
 	}
 
+	private transformMessageForDisplay<T extends AgentMessage>(message: T): T {
+		return (this.session.extensionRunner?.transformMessageForDisplay(message) ?? message) as T;
+	}
+
+	private getAssistantMessageText(message: AssistantMessage): string {
+		let text = "";
+		for (const content of message.content) {
+			if (content.type === "text") {
+				text += content.text;
+			}
+		}
+		return text.trim();
+	}
+
 	/**
 	 * Show a status message in the chat.
 	 *
@@ -2452,25 +2466,34 @@ export class InteractiveMode {
 	}
 
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
-		switch (message.role) {
+		const displayMessage = this.transformMessageForDisplay(message);
+		switch (displayMessage.role) {
 			case "bashExecution": {
-				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext);
-				if (message.output) {
-					component.appendOutput(message.output);
+				const component = new BashExecutionComponent(
+					displayMessage.command,
+					this.ui,
+					displayMessage.excludeFromContext,
+				);
+				if (displayMessage.output) {
+					component.appendOutput(displayMessage.output);
 				}
 				component.setComplete(
-					message.exitCode,
-					message.cancelled,
-					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
-					message.fullOutputPath,
+					displayMessage.exitCode,
+					displayMessage.cancelled,
+					displayMessage.truncated ? ({ truncated: true } as TruncationResult) : undefined,
+					displayMessage.fullOutputPath,
 				);
 				this.chatContainer.addChild(component);
 				break;
 			}
 			case "custom": {
-				if (message.display) {
-					const renderer = this.session.extensionRunner?.getMessageRenderer(message.customType);
-					const component = new CustomMessageComponent(message, renderer, this.getMarkdownThemeWithSettings());
+				if (displayMessage.display) {
+					const renderer = this.session.extensionRunner?.getMessageRenderer(displayMessage.customType);
+					const component = new CustomMessageComponent(
+						displayMessage,
+						renderer,
+						this.getMarkdownThemeWithSettings(),
+					);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);
 				}
@@ -2478,20 +2501,23 @@ export class InteractiveMode {
 			}
 			case "compactionSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+				const component = new CompactionSummaryMessageComponent(
+					displayMessage,
+					this.getMarkdownThemeWithSettings(),
+				);
 				component.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(component);
 				break;
 			}
 			case "branchSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+				const component = new BranchSummaryMessageComponent(displayMessage, this.getMarkdownThemeWithSettings());
 				component.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(component);
 				break;
 			}
 			case "user": {
-				const textContent = this.getUserMessageText(message);
+				const textContent = this.getUserMessageText(displayMessage);
 				if (textContent) {
 					const skillBlock = parseSkillBlock(textContent);
 					if (skillBlock) {
@@ -2523,7 +2549,7 @@ export class InteractiveMode {
 			}
 			case "assistant": {
 				const assistantComponent = new AssistantMessageComponent(
-					message,
+					displayMessage,
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
 				);
@@ -2535,7 +2561,7 @@ export class InteractiveMode {
 				break;
 			}
 			default: {
-				const _exhaustive: never = message;
+				const _exhaustive: never = displayMessage;
 			}
 		}
 	}
@@ -4065,7 +4091,13 @@ export class InteractiveMode {
 	}
 
 	private async handleCopyCommand(): Promise<void> {
-		const text = this.session.getLastAssistantText();
+		const lastAssistant = this.session.messages
+			.slice()
+			.reverse()
+			.find((message): message is AssistantMessage => message.role === "assistant");
+		const text = lastAssistant
+			? this.getAssistantMessageText(this.transformMessageForDisplay(lastAssistant))
+			: undefined;
 		if (!text) {
 			this.showError("No agent messages to copy yet.");
 			return;
