@@ -14,6 +14,14 @@ export interface ChatTranslationResult {
 	skippedReason?: string;
 }
 
+function toErrorReason(prefix: "llm" | "deeplx", error: unknown): string {
+	if (error instanceof Error) {
+		const message = error.message.replace(/\s+/g, "_").slice(0, 120);
+		return `${prefix}_exception_${message || error.name || "error"}`;
+	}
+	return `${prefix}_exception_unknown`;
+}
+
 function containsChinese(text: string): boolean {
 	return /[\u4e00-\u9fff]/.test(text);
 }
@@ -243,25 +251,34 @@ async function translateText(text: string, direction: TranslationDirection): Pro
 
 	try {
 		const apiKey = process.env.PI_CHAT_TRANSLATE_API_KEY?.trim();
+		let llmSkippedReason: string | undefined;
 		if (apiKey) {
 			try {
 				const llmResult = await translateWithLlm(text, direction, apiKey, controller.signal);
 				if (llmResult.applied) {
 					return llmResult;
 				}
-			} catch {
-				// Fall through to DeepLX.
+				llmSkippedReason = llmResult.skippedReason;
+			} catch (error) {
+				llmSkippedReason = toErrorReason("llm", error);
 			}
 		}
 
 		try {
-			return await translateWithDeeplx(text, direction, controller.signal);
-		} catch {
+			const deeplxResult = await translateWithDeeplx(text, direction, controller.signal);
+			if (deeplxResult.applied) {
+				return deeplxResult;
+			}
+			return {
+				...deeplxResult,
+				skippedReason: [llmSkippedReason, deeplxResult.skippedReason].filter(Boolean).join(";") || undefined,
+			};
+		} catch (error) {
 			return {
 				attempted: true,
 				applied: false,
 				text,
-				skippedReason: "llm_and_deeplx_request_failed",
+				skippedReason: [llmSkippedReason, toErrorReason("deeplx", error)].filter(Boolean).join(";"),
 			};
 		}
 	} finally {
