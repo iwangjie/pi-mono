@@ -31,19 +31,12 @@ export default function probeExtension(pi: ExtensionAPI) {
 				`
 
 Probe CLI tools are available:
-- Use probe_search first for discovery. Prefer short targeted keywords, exact identifiers, Chinese labels, or 2-6 term queries instead of long business questions.
-- For probe_search, prefer reranker=hybrid unless you have a reason not to. Use exact=true for specific method names, variables, constants, or exact phrases.
-- For probe_search, prefer output_mode=agent_json so you can read stable fields like execution, candidates, best_span, confidence, and extract_target.
-- For probe_search, keep code_only=true unless you intentionally want docs, config, jsp, sql, or templates.
-- For "核心方法是哪个" 这类问题， prefer using probe_core_method instead of manually tuning probe_search.
-- Use intent=core_method when the question is "核心方法是哪个" or when you need a Controller/Route -> Service -> DAO style chain.
-- Use module_hint when you already suspect a module or bounded area, for example trans-business.
-- Use module_scope=strict when the module boundary is known and you want Probe to stay inside it.
-- Leave auto_retry_reranker enabled so Probe can retry hybrid -> hybrid2 -> bm25 when the first reranker falls back.
-- Use strict_reranker=true only when you must guarantee the requested reranker was actually applied.
-- If probe_search finds a promising file or line range, call probe_extract next with file, path:line, path:start-end, or path#symbol.
-- Use probe_query only when you need structural matching. Start loose with placeholders like $NAME, $$$ARGS, $$$BODY.
-- For probe_query, do not hardcode full Java signatures on the first try. Avoid fixing return type, modifiers, annotations, and throws clauses unless required.
+- Default to probe_core_method when the task is to find the core method, entrypoint, handler, dispatch path, or main execution chain.
+- If you know the bounded area, pass module_hint. This is the main way to improve stability; do not start by tuning many Probe parameters.
+- Use probe_search as the expert fallback for manual exploration. Prefer short 2-6 term queries or exact identifiers, not long business questions.
+- If probe_search returns a promising file or line range, call probe_extract next with file, path:line, path:start-end, or path#symbol.
+- Use probe_query only for structural matching after search or extract already narrowed the area. Start loose with placeholders like $NAME, $$$ARGS, $$$BODY.
+- Read primary_failure_reason and best_next_change before retrying. Change one thing at a time.
 - These tools call the local Probe CLI directly. Do not assume MCP is involved.
 `,
 		};

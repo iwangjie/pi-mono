@@ -80,6 +80,8 @@ export interface ProbeSearchPayload {
 		returned_files: number;
 	};
 	candidates: ProbeSearchCandidate[];
+	primary_failure_reason?: string;
+	best_next_change?: string;
 	suggestions: string[];
 }
 
@@ -684,6 +686,85 @@ function deriveWhyThisIsCore(hit: RankedProbeSearchHit): string[] {
 	return Array.from(new Set(reasons)).slice(0, 6);
 }
 
+function deriveSearchGuidance(
+	query: string,
+	candidates: ProbeSearchCandidate[],
+	options: {
+		executionAttempts: ProbeSearchPayload["execution"]["attempts"];
+		moduleHint: string[];
+		moduleScope: "prefer" | "strict";
+		filesOnlyRequested: boolean;
+		exact: boolean;
+		codeOnly: boolean;
+	},
+): { primaryFailureReason?: string; bestNextChange?: string } {
+	const finalAttempt = options.executionAttempts[options.executionAttempts.length - 1];
+	const topCandidate = candidates[0];
+	const queryTermCount = splitQueryTerms(query).length;
+
+	if (candidates.length === 0) {
+		if (options.moduleScope === "strict" && options.moduleHint.length > 0) {
+			return {
+				primaryFailureReason: `No candidates survived strict module filtering for ${options.moduleHint.join(", ")}.`,
+				bestNextChange: "Loosen module_scope to prefer or widen module_hint before changing other parameters.",
+			};
+		}
+		if (finalAttempt?.fallback_reason) {
+			return {
+				primaryFailureReason:
+					"Requested semantic reranker did not hold and Probe fell back to keyword-style ranking, so broad business terms likely drifted.",
+				bestNextChange:
+					options.moduleHint.length > 0
+						? "Keep the module hint and shorten the query to 2-6 keywords or a known identifier."
+						: "Add module_hint first, or shorten the query to 2-6 keywords instead of a long business sentence.",
+			};
+		}
+		if (queryTermCount > 6) {
+			return {
+				primaryFailureReason: "The query is likely too broad and mixes business language with code intent.",
+				bestNextChange:
+					"Rewrite the query to 2-6 focused keywords, or switch to a high-level workflow like probe_core_method.",
+			};
+		}
+		if (options.codeOnly) {
+			return {
+				primaryFailureReason: "Probe found no code candidates after code-only filtering.",
+				bestNextChange: "If you expect templates or docs to carry routing clues, retry with code_only=false.",
+			};
+		}
+		return {
+			primaryFailureReason: "Probe did not produce a candidate strong enough to keep after filtering and ranking.",
+			bestNextChange:
+				options.moduleHint.length > 0
+					? "Keep the module hint and try exact identifiers, funCode names, or a target class name next."
+					: "Add a module_hint or an exact identifier such as a class, method, enum, or funCode name.",
+		};
+	}
+
+	if (finalAttempt?.fallback_reason && topCandidate?.confidence !== "high") {
+		return {
+			primaryFailureReason:
+				"Semantic reranking fell back, so the current ranking is closer to BM25 keyword matching than concept search.",
+			bestNextChange:
+				options.moduleHint.length > 0
+					? "Keep the module hint and inspect the top candidate with probe_extract before broadening the search."
+					: "Add module_hint to stabilize ranking before changing other knobs.",
+		};
+	}
+
+	if (topCandidate?.confidence === "low" && !options.filesOnlyRequested) {
+		return {
+			primaryFailureReason:
+				"Top candidates are low-confidence and likely need one more narrowing step before extraction.",
+			bestNextChange: options.exact
+				? "Keep exact matching and add module_hint or include_globs to narrow the search scope."
+				: "Retry with files_only=true first, then extract the best-ranked file or add exact=true for a known identifier.",
+		};
+	}
+
+	return {};
+}
+
 function buildProbeSearchPayload(
 	output: string,
 	query: string,
@@ -794,6 +875,14 @@ function buildProbeSearchPayload(
 		options.executionAttempts[options.executionAttempts.length - 1] ??
 		createExecutionAttempt(options.reranker, parsed.actualRankingLine);
 	const primaryCandidate = candidates[0];
+	const guidance = deriveSearchGuidance(query, candidates, {
+		executionAttempts: options.executionAttempts,
+		moduleHint: options.moduleHint,
+		moduleScope: options.moduleScope,
+		filesOnlyRequested: options.filesOnlyRequested,
+		exact: options.exact,
+		codeOnly: options.codeOnly,
+	});
 
 	return {
 		query,
@@ -829,9 +918,14 @@ function buildProbeSearchPayload(
 			returned_files: candidates.length,
 		},
 		candidates,
+		primary_failure_reason: guidance.primaryFailureReason,
+		best_next_change: guidance.bestNextChange,
 		suggestions: primaryCandidate
 			? [
 					`Next best action: probe_extract ${primaryCandidate.extract_target}`,
+					...(guidance.bestNextChange
+						? [`Best next change if this still looks wrong: ${guidance.bestNextChange}`]
+						: []),
 					(primaryCandidate.upstream_routes?.length ?? 0) > 0
 						? "If you need entrypoint proof, continue by extracting the route/funCode carrier or enum next."
 						: "If you need stronger routing evidence, continue by extracting the nearest controller/handler candidate.",
@@ -843,6 +937,7 @@ function buildProbeSearchPayload(
 						: "If results are noisy, retry with files_only=true or tighter include_globs/exclude_globs.",
 				]
 			: [
+					...(guidance.bestNextChange ? [`Best next change: ${guidance.bestNextChange}`] : []),
 					"No strong candidates. Relax the query, remove filters, or try probe_query with a loose structural pattern.",
 				],
 	};
@@ -868,6 +963,12 @@ function renderSmartProbeSearchResult(payload: ProbeSearchPayload, maxLinesPerSn
 	lines.push(`- Raw hits: ${payload.summary.raw_hits}`);
 	lines.push(`- Filtered hits: ${payload.summary.filtered_hits}`);
 	lines.push(`- Unique files: ${payload.summary.unique_files}`);
+	if (payload.primary_failure_reason) {
+		lines.push(`- Primary failure reason: ${payload.primary_failure_reason}`);
+	}
+	if (payload.best_next_change) {
+		lines.push(`- Best next change: ${payload.best_next_change}`);
+	}
 	lines.push("");
 	lines.push("Top files");
 
