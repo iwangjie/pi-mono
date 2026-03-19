@@ -34,7 +34,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `questionnaire.ts` | Multi-question input with tab bar navigation between questions |
 | `tool-override.ts` | Override built-in tools (e.g., add logging/access control to `read`) |
 | `dynamic-tools.ts` | Register tools after startup (`session_start`) and at runtime via command, with prompt snippets and tool-specific prompt guidelines |
-| `probe/` | Registers local Probe CLI tools including the higher-level `probe_core_method` workflow, tuned by default for Java/Maven/JSP/Spring-style codebases and concise system guidance that prefers high-level entrypoint/core-method discovery before expert search tuning. Optional translation env vars: `PI_PROBE_TRANSLATE_API_KEY`, `PI_PROBE_TRANSLATE_DEEPLX_KEY`, `PI_PROBE_TRANSLATE_DEEPLX_BASE_URL` |
+| `probe/` | Registers local Probe CLI tools including the higher-level `probe_core_method` workflow, tuned by default for Java/Maven/JSP/Spring-style codebases and concise system guidance that prefers high-level entrypoint/core-method discovery before expert search tuning. Optional translation env vars: `PI_CHAT_TRANSLATE_API_KEY`, `PI_CHAT_TRANSLATE_DEEPLX_KEY`, `PI_CHAT_TRANSLATE_DEEPLX_BASE_URL` |
 | `built-in-tool-renderer.ts` | Custom compact rendering for built-in tools (read, bash, edit, write) while keeping original behavior |
 | `minimal-mode.ts` | Override built-in tool rendering for minimal display (only tool calls, no output in collapsed mode) |
 | `truncated-tool.ts` | Wraps ripgrep with proper output truncation (50KB/2000 lines) |
@@ -106,6 +106,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 
 | Extension | Description |
 |-----------|-------------|
+| `chat-translate/` | Keeps LLM interaction in English while displaying translated Chinese user/assistant messages via display-only message transforms and persisted sidecar metadata |
 | `message-renderer.ts` | Custom message rendering with colors and expandable details via `registerMessageRenderer` |
 | `event-bus.ts` | Inter-extension communication via `pi.events` |
 

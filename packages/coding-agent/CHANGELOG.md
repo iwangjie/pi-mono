@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added display-only message transformers for extensions, allowing TUI and print output to diverge from persisted/session context without affecting LLM input or cache behavior
+- Added `examples/extensions/chat-translate/`, which rewrites Chinese prompts into English for the LLM while displaying persisted Chinese user/assistant text via display-only transforms
+
 ### Fixed
 
 - Tests for session-selector-rename and tree-selector are now keybinding-agnostic, resetting editor keybindings to defaults before each test so user `keybindings.json` cannot cause failures ([#2360](https://github.com/badlogic/pi-mono/issues/2360))
